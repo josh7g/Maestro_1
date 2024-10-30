@@ -60,6 +60,18 @@ def handle_webhook():
             payload = request.json
             installation_id = payload['installation']['id']
             
+            # Retrieve public keys for the installation
+            public_keys = git_integration.get_public_keys(installation_id)
+            if not public_keys:
+                logger.error("No public keys found for this installation.")
+                return jsonify({"error": "No public keys found"}), 400
+            
+            public_key = public_keys[0].key
+            logger.info(f"Public Key: {public_key}")
+
+            # Verify the webhook signature
+            # (You can add your logic here to verify the payload using the public key)
+
             # Get the access token for the installation
             access_token = git_integration.get_access_token(installation_id).token
             github_client = Github(access_token)
