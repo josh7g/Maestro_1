@@ -19,14 +19,11 @@ WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
 PORT = os.getenv('RENDER_PORT', 5000)
 
 # GitHub Integration instance
-PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY")
-if not PRIVATE_KEY_PATH:
+PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY")
+if not PRIVATE_KEY:
     raise ValueError("GITHUB_APP_PRIVATE_KEY environment variable not set or empty")
 
-with open(PRIVATE_KEY_PATH, 'r') as key_file:
-    private_key = key_file.read()
-
-git_integration = GithubIntegration(APP_ID, private_key)
+git_integration = GithubIntegration(APP_ID, PRIVATE_KEY)
 
 def trigger_semgrep_analysis(repo_url):
     """
