@@ -4,10 +4,6 @@ from github import Github, GithubIntegration
 import subprocess
 import logging
 from dotenv import load_dotenv
-import requests
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import serialization
 
 app = Flask(__name__)
 
@@ -28,55 +24,6 @@ if not PRIVATE_KEY:
     raise ValueError("GITHUB_APP_PRIVATE_KEY environment variable not set or empty")
 
 git_integration = GithubIntegration(APP_ID, PRIVATE_KEY)
-
-def fetch_public_key(app_id):
-    """
-    Fetch the public key for webhook verification from GitHub.
-    """
-    try:
-        # Get a JWT for authenticating as the GitHub App itself
-        jwt_token = git_integration.create_jwt()
-        headers = {
-            "Authorization": f"Bearer {jwt_token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-
-        # Fetch the public key using GitHub's REST API
-        response = requests.get(f"https://api.github.com/app/hook/config", headers=headers)
-        response.raise_for_status()
-
-        # Extract and return the public key in PEM format
-        public_key_pem = response.json()["public_key"]
-        
-        # Add header and footer if missing
-        if not public_key_pem.startswith("-----BEGIN PUBLIC KEY-----"):
-            public_key_pem = f"-----BEGIN PUBLIC KEY-----\n{public_key_pem}\n-----END PUBLIC KEY-----"
-        
-        return public_key_pem
-
-    except Exception as e:
-        logger.error(f"Error fetching public key: {str(e)}")
-        return None
-
-def verify_signature(public_key_pem, payload, signature):
-    """
-    Verify the webhook signature using the provided public key.
-    """
-    try:
-        # Convert the key from string to bytes and load it
-        public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
-
-        # Verify the signature (assuming the signature is in a base64-encoded string)
-        public_key.verify(
-            signature.encode("utf-8"),  # Convert signature to bytes
-            payload,
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error verifying signature: {str(e)}")
-        return False
 
 def trigger_semgrep_analysis(repo_url):
     """
@@ -113,11 +60,6 @@ def handle_webhook():
             payload = request.json
             installation_id = payload['installation']['id']
             
-            # Fetch the public key for verifying the webhook
-            public_key_pem = fetch_public_key(APP_ID)
-            if not public_key_pem:
-                return jsonify({"error": "Could not fetch public key"}), 500
-
             # Get the access token for the installation
             access_token = git_integration.get_access_token(installation_id).token
             github_client = Github(access_token)
