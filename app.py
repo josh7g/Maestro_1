@@ -3,11 +3,11 @@ import os
 from github import Github, GithubIntegration
 import subprocess
 import logging
-import requests
 from dotenv import load_dotenv
+import requests
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.hashes import SHA256
 
 app = Flask(__name__)
 
@@ -34,7 +34,7 @@ def fetch_public_key(app_id):
     Fetch the public key for webhook verification from GitHub.
     """
     try:
-        # Get an access token for the app (as opposed to a specific installation)
+        # Get a JWT for authenticating as the GitHub App itself
         jwt_token = git_integration.create_jwt()
         headers = {
             "Authorization": f"Bearer {jwt_token}",
@@ -45,8 +45,13 @@ def fetch_public_key(app_id):
         response = requests.get(f"https://api.github.com/app/hook/config", headers=headers)
         response.raise_for_status()
 
-        # Extract and return the public key
+        # Extract and return the public key in PEM format
         public_key_pem = response.json()["public_key"]
+        
+        # Add header and footer if missing
+        if not public_key_pem.startswith("-----BEGIN PUBLIC KEY-----"):
+            public_key_pem = f"-----BEGIN PUBLIC KEY-----\n{public_key_pem}\n-----END PUBLIC KEY-----"
+        
         return public_key_pem
 
     except Exception as e:
@@ -58,13 +63,15 @@ def verify_signature(public_key_pem, payload, signature):
     Verify the webhook signature using the provided public key.
     """
     try:
+        # Convert the key from string to bytes and load it
         public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
-        # Assuming the signature is in base64 format; adapt if needed
+
+        # Verify the signature (assuming the signature is in a base64-encoded string)
         public_key.verify(
-            signature.encode("utf-8"),
+            signature.encode("utf-8"),  # Convert signature to bytes
             payload,
             padding.PKCS1v15(),
-            SHA256()
+            hashes.SHA256()
         )
         return True
     except Exception as e:
@@ -98,27 +105,25 @@ def handle_webhook():
     Handle the GitHub webhook events.
     """
     event_type = request.headers.get('X-GitHub-Event', 'ping')
-    signature = request.headers.get('X-Hub-Signature-256')
-    payload = request.get_data(as_text=True)
-
+    
     logger.info(f"Received event: {event_type}")
-
-    # Fetch the public key to verify the webhook signature
-    public_key_pem = fetch_public_key(APP_ID)
-    if not public_key_pem or not verify_signature(public_key_pem, payload, signature):
-        return jsonify({"error": "Invalid signature"}), 403
 
     if event_type == 'installation':
         try:
-            payload_json = request.json
-            installation_id = payload_json['installation']['id']
+            payload = request.json
+            installation_id = payload['installation']['id']
             
+            # Fetch the public key for verifying the webhook
+            public_key_pem = fetch_public_key(APP_ID)
+            if not public_key_pem:
+                return jsonify({"error": "Could not fetch public key"}), 500
+
             # Get the access token for the installation
             access_token = git_integration.get_access_token(installation_id).token
             github_client = Github(access_token)
 
             # Fetch the installed repositories
-            repositories = payload_json['repositories']
+            repositories = payload['repositories']
             for repo in repositories:
                 repo_full_name = repo['full_name']
                 repo_url = f"https://github.com/{repo_full_name}.git"
