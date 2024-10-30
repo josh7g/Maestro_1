@@ -1,8 +1,8 @@
 from flask import Flask, request, jsonify
 import os
-from github import Github, GithubIntegration
 import subprocess
 import logging
+from github import Github, GithubIntegration
 from dotenv import load_dotenv
 
 app = Flask(__name__)
@@ -18,11 +18,12 @@ APP_ID = os.getenv('GITHUB_APP_ID')
 WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
 PORT = os.getenv('RENDER_PORT', 5000)
 
-# GitHub Integration instance
-PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY")
+# Private Key: Replace '\n' with actual newlines
+PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY").replace('\\n', '\n')
 if not PRIVATE_KEY:
     raise ValueError("GITHUB_APP_PRIVATE_KEY environment variable not set or empty")
 
+# GitHub Integration instance
 git_integration = GithubIntegration(APP_ID, PRIVATE_KEY)
 
 def trigger_semgrep_analysis(repo_url):
@@ -65,7 +66,7 @@ def handle_webhook():
             github_client = Github(access_token)
 
             # Fetch the installed repositories
-            repositories = payload['repositories']
+            repositories = payload.get('repositories', [])
             for repo in repositories:
                 repo_full_name = repo['full_name']
                 repo_url = f"https://github.com/{repo_full_name}.git"
