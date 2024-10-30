@@ -1,21 +1,28 @@
-# app.py
 from flask import Flask, request, jsonify
 import os
 from github import Github, GithubIntegration
 import subprocess
+import logging
+from dotenv import load_dotenv
 
 app = Flask(__name__)
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
-from dotenv import load_dotenv
 load_dotenv()
 
 APP_ID = os.getenv('GITHUB_APP_ID')
 WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
-PRIVATE_KEY_PATH = os.getenv('GITHUB_PRIVATE_KEY_PATH')
 PORT = os.getenv('RENDER_PORT', 5000)
 
 # GitHub Integration instance
+PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY")
+if not PRIVATE_KEY_PATH:
+    raise ValueError("GITHUB_APP_PRIVATE_KEY environment variable not set or empty")
+
 with open(PRIVATE_KEY_PATH, 'r') as key_file:
     private_key = key_file.read()
 
@@ -35,11 +42,11 @@ def trigger_semgrep_analysis(repo_url):
         result = subprocess.run(["semgrep", "--config=auto", clone_dir], capture_output=True, text=True)
 
         # Process the results (you can customize this part)
-        print("Semgrep Output:", result.stdout)
+        logger.info("Semgrep Output:\n%s", result.stdout)
         return result.stdout
 
     except subprocess.CalledProcessError as e:
-        print("Error running Semgrep:", e)
+        logger.error("Error running Semgrep: %s", e.stderr)
         return None
 
 @app.route('/webhook', methods=['POST'])
@@ -48,22 +55,29 @@ def handle_webhook():
     Handle the GitHub webhook events.
     """
     event_type = request.headers.get('X-GitHub-Event', 'ping')
+    
+    logger.info(f"Received event: {event_type}")
 
     if event_type == 'installation':
-        payload = request.json
-        installation_id = payload['installation']['id']
-        
-        # Get the access token for the installation
-        access_token = git_integration.get_access_token(installation_id).token
-        github_client = Github(access_token)
+        try:
+            payload = request.json
+            installation_id = payload['installation']['id']
+            
+            # Get the access token for the installation
+            access_token = git_integration.get_access_token(installation_id).token
+            github_client = Github(access_token)
 
-        # Fetch the installed repositories
-        repositories = payload['repositories']
-        for repo in repositories:
-            repo_full_name = repo['full_name']
-            repo_url = f"https://github.com/{repo_full_name}.git"
-            semgrep_output = trigger_semgrep_analysis(repo_url)
-            print(f"Semgrep Output for {repo_full_name}:", semgrep_output)
+            # Fetch the installed repositories
+            repositories = payload['repositories']
+            for repo in repositories:
+                repo_full_name = repo['full_name']
+                repo_url = f"https://github.com/{repo_full_name}.git"
+                semgrep_output = trigger_semgrep_analysis(repo_url)
+                logger.info(f"Semgrep Output for {repo_full_name}: {semgrep_output}")
+
+        except Exception as e:
+            logger.error(f"Error processing installation event: {str(e)}")
+            return jsonify({"error": "Internal Server Error"}), 500
 
     return jsonify({"message": "Webhook received"}), 200
 
