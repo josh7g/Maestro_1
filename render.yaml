@@ -15,7 +15,3 @@ services:
         sync: false
     healthCheckPath: /health
     autoDeploy: true
-    disk:
-      name: tmp
-      mountPath: /tmp
-      sizeGB: 1

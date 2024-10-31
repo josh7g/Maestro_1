@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import shutil
 import json
+import base64
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
 from datetime import datetime
@@ -16,7 +17,7 @@ if os.getenv('FLASK_ENV') != 'production':
     load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Configure logging
 logging.basicConfig(
@@ -25,41 +26,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Store results in memory (consider using Redis for production)
+# Store results in memory
 analysis_results = {}
 
 def format_private_key(key_data):
-    """Format the private key correctly."""
+    """Format the private key correctly for GitHub integration"""
     try:
+        if not key_data:
+            raise ValueError("Private key is empty")
+        
+        # Remove any whitespace and normalize line endings
         key_data = key_data.strip()
-        key_parts = key_data.replace('\\n', '\n').split('\n')
-        key_parts = [part.strip() for part in key_parts if part.strip()]
         
-        formatted_key = []
-        if not key_parts[0].startswith('-----BEGIN RSA PRIVATE KEY-----'):
-            formatted_key.append('-----BEGIN RSA PRIVATE KEY-----')
-        else:
-            formatted_key.append(key_parts[0])
-            key_parts = key_parts[1:]
+        # Handle different potential formats
+        if '\\n' in key_data:
+            # Handle escaped newlines
+            parts = key_data.split('\\n')
+            key_data = '\n'.join(part.strip() for part in parts if part.strip())
+        elif '\n' not in key_data:
+            # Handle single-line key
+            key_length = len(key_data)
+            if key_length < 64:  # Minimum size for a valid key
+                raise ValueError("Key content too short")
+            
+            # Extract the key content and format properly
+            if not key_data.startswith('-----BEGIN'):
+                key_data = (
+                    '-----BEGIN RSA PRIVATE KEY-----\n' +
+                    '\n'.join(key_data[i:i+64] for i in range(0, len(key_data), 64)) +
+                    '\n-----END RSA PRIVATE KEY-----'
+                )
         
-        for part in key_parts:
-            if not (part.startswith('----') or part.endswith('----')):
-                formatted_key.append(part)
+        # Ensure proper header and footer
+        if not key_data.startswith('-----BEGIN RSA PRIVATE KEY-----'):
+            key_data = '-----BEGIN RSA PRIVATE KEY-----\n' + key_data
+        if not key_data.endswith('-----END RSA PRIVATE KEY-----'):
+            key_data = key_data + '\n-----END RSA PRIVATE KEY-----'
         
-        if not key_parts[-1].endswith('-----END RSA PRIVATE KEY-----'):
-            formatted_key.append('-----END RSA PRIVATE KEY-----')
+        # Validate key format
+        lines = key_data.split('\n')
+        if len(lines) < 3:
+            raise ValueError("Invalid key format - too few lines")
         
-        result = '\n'.join(formatted_key)
-        return result
+        logger.info("Private key formatted successfully")
+        return key_data
         
     except Exception as e:
         logger.error(f"Error formatting private key: {str(e)}")
-        raise
+        raise ValueError(f"Private key formatting failed: {str(e)}")
 
 def verify_webhook_signature(request_data, signature_header):
     """Verify webhook signature"""
     try:
         if not WEBHOOK_SECRET or not signature_header:
+            logger.error("Missing webhook secret or signature")
             return False
 
         expected_signature = 'sha256=' + hmac.new(
@@ -81,7 +101,7 @@ def clean_directory(directory):
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
 def format_semgrep_results(raw_results):
-    """Format Semgrep results for frontend consumption"""
+    """Format Semgrep results for frontend"""
     try:
         if isinstance(raw_results, str):
             results = json.loads(raw_results)
@@ -199,22 +219,14 @@ def trigger_semgrep_analysis(repo_url, installation_token):
             clean_directory(clone_dir)
 
 # Load configuration
-required_env_vars = {
-    'GITHUB_APP_ID': 'GitHub App ID not configured',
-    'GITHUB_WEBHOOK_SECRET': 'Webhook secret not configured',
-    'GITHUB_APP_PRIVATE_KEY': 'GitHub App private key not configured'
-}
-
-for var, message in required_env_vars.items():
-    if not os.getenv(var):
-        raise ValueError(message)
-
-APP_ID = os.getenv('GITHUB_APP_ID')
-WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
-PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
-PORT = int(os.getenv('PORT', 10000))
-
 try:
+    APP_ID = os.getenv('GITHUB_APP_ID')
+    WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
+    PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
+    
+    if not all([APP_ID, WEBHOOK_SECRET, PRIVATE_KEY]):
+        raise ValueError("Missing required environment variables")
+    
     formatted_key = format_private_key(PRIVATE_KEY)
     git_integration = GithubIntegration(
         integration_id=int(APP_ID),
@@ -222,10 +234,24 @@ try:
     )
     logger.info("GitHub Integration initialized successfully")
 except Exception as e:
-    logger.error(f"GitHub Integration initialization failed: {str(e)}")
+    logger.error(f"Configuration error: {str(e)}")
     raise
 
 # API Routes
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint - API information"""
+    return jsonify({
+        'status': 'healthy',
+        'version': '1.0.0',
+        'endpoints': {
+            '/webhook': 'GitHub webhook endpoint',
+            '/api/v1/analysis/status': 'Get all analyses status',
+            '/api/v1/analysis/<owner>/<repo>/summary': 'Get repository analysis summary',
+            '/api/v1/analysis/<owner>/<repo>/findings': 'Get detailed analysis findings'
+        }
+    }), 200
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Render"""
@@ -380,7 +406,7 @@ def get_analysis_findings(owner, repo):
         return jsonify({
             'success': True,
             'data': {
-                'repository': {
+                'repository':  {
                     'name': repo_name,
                     'owner': owner,
                     'repo': repo
@@ -407,7 +433,6 @@ def get_analysis_findings(owner, repo):
         return jsonify({
             'success': False,
             'error': {
-                
                 'message': 'Failed to fetch findings',
                 'details': str(e)
             }
@@ -417,8 +442,12 @@ def get_analysis_findings(owner, repo):
 def handle_webhook():
     """Handle GitHub webhook events"""
     try:
+        logger.info("Received webhook request")
+        
+        # Verify webhook signature
         signature = request.headers.get('X-Hub-Signature-256')
         if not verify_webhook_signature(request.get_data(), signature):
+            logger.error("Invalid webhook signature")
             return jsonify({
                 'success': False,
                 'error': {
@@ -446,8 +475,20 @@ def handle_webhook():
                 })
 
             installation_id = payload['installation']['id']
-            installation_token = git_integration.get_access_token(installation_id).token
-            github_client = Github(installation_token)
+            logger.info(f"Processing installation ID: {installation_id}")
+
+            try:
+                installation_token = git_integration.get_access_token(installation_id).token
+                github_client = Github(installation_token)
+            except Exception as e:
+                logger.error(f"Failed to get installation token: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Failed to authenticate with GitHub',
+                        'details': str(e)
+                    }
+                }), 500
 
             results = {}
             repositories = payload.get('repositories', [])
@@ -529,8 +570,8 @@ def handle_webhook():
         }), 500
 
 if __name__ == '__main__':
-    # Use production WSGI server if in production
+    port = int(os.getenv('PORT', 10000))
     if os.getenv('FLASK_ENV') == 'production':
-        app.run(host='0.0.0.0', port=PORT)
+        app.run(host='0.0.0.0', port=port)
     else:
-        app.run(host='127.0.0.1', port=PORT, debug=True)
+        app.run(host='127.0.0.1', port=port, debug=True)
