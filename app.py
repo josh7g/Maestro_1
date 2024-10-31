@@ -7,9 +7,6 @@ import hashlib
 import shutil
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
-import signal
-from contextlib import contextmanager
-import timeout_decorator
 
 # Load environment variables only in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -27,21 +24,6 @@ logger = logging.getLogger(__name__)
 # Configure timeout values
 SEMGREP_TIMEOUT = 300  # 5 minutes for Semgrep analysis
 CLONE_TIMEOUT = 60     # 1 minute for git clone
-
-@contextmanager
-def timeout(seconds):
-    def signal_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
-    
-    # Register a function to raise a TimeoutError on the signal
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    
-    try:
-        yield
-    finally:
-        # Disable the alarm
-        signal.alarm(0)
 
 def format_private_key(key_data):
     """Format the private key correctly."""
@@ -113,25 +95,25 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
-@timeout_decorator.timeout(SEMGREP_TIMEOUT)
-def run_semgrep_analysis(clone_dir):
-    """Run Semgrep analysis with timeout"""
-    return subprocess.run(
-        ["semgrep", "--config=auto", "--json", clone_dir],
-        capture_output=True,
-        text=True,
-        check=True
-    )
-
-@timeout_decorator.timeout(CLONE_TIMEOUT)
-def clone_repository(repo_url_with_auth, clone_dir):
-    """Clone repository with timeout"""
-    return subprocess.run(
-        ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
-        check=True,
-        capture_output=True,
-        text=True
-    )
+def run_command_with_timeout(command, timeout_seconds, working_dir=None):
+    """Run a command with timeout"""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=working_dir,
+            check=True
+        )
+        return result
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Command timed out after {timeout_seconds} seconds: {' '.join(command)}")
+        raise
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"Error output: {e.stderr}")
+        raise
 
 def trigger_semgrep_analysis(repo_url, installation_token):
     """Clone repository and run Semgrep scan with proper authentication"""
@@ -149,23 +131,26 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         
         logger.info(f"Cloning repository to {clone_dir}")
         try:
-            clone_repository(repo_url_with_auth, clone_dir)
-        except timeout_decorator.TimeoutError:
-            logger.error("Repository clone timed out")
+            run_command_with_timeout(
+                ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
+                CLONE_TIMEOUT
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            logger.error("Repository clone failed")
             return None
         
         logger.info("Running Semgrep analysis")
         try:
-            result = run_semgrep_analysis(clone_dir)
+            result = run_command_with_timeout(
+                ["semgrep", "--config=auto", "--json", "."],
+                SEMGREP_TIMEOUT,
+                working_dir=clone_dir
+            )
             return result.stdout
-        except timeout_decorator.TimeoutError:
-            logger.error("Semgrep analysis timed out")
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            logger.error("Semgrep analysis failed")
             return None
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed: {e.cmd}")
-        logger.error(f"Error output: {e.stderr}")
-        return None
     except Exception as e:
         logger.error(f"Error in Semgrep analysis: {str(e)}")
         return None
