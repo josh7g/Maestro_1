@@ -5,8 +5,10 @@ import logging
 import hmac
 import hashlib
 import shutil
+import json
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Load environment variables only in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -21,9 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure timeout values
-SEMGREP_TIMEOUT = 300  # 5 minutes for Semgrep analysis
-CLONE_TIMEOUT = 60     # 1 minute for git clone
+# Store results in memory
+analysis_results = {}
 
 def format_private_key(key_data):
     """Format the private key correctly."""
@@ -95,64 +96,62 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
-def run_command_with_timeout(command, timeout_seconds, working_dir=None):
-    """Run a command with timeout"""
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=working_dir,
-            check=True
-        )
-        return result
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"Command timed out after {timeout_seconds} seconds: {' '.join(command)}")
-        raise
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed: {' '.join(command)}")
-        logger.error(f"Error output: {e.stderr}")
-        raise
-
 def trigger_semgrep_analysis(repo_url, installation_token):
     """Clone repository and run Semgrep scan with proper authentication"""
     clone_dir = None
+    repo_name = repo_url.split('/')[-1].replace('.git', '')
+    
     try:
         repo_url_with_auth = repo_url.replace(
             "https://",
             f"https://x-access-token:{installation_token}@"
         )
         
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
         clone_dir = f"/tmp/semgrep_{repo_name}_{os.getpid()}"
+        
+        # Store initial status
+        analysis_results[repo_name] = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'status': 'in_progress',
+            'results': None
+        }
         
         clean_directory(clone_dir)
         
         logger.info(f"Cloning repository to {clone_dir}")
-        try:
-            run_command_with_timeout(
-                ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
-                CLONE_TIMEOUT
-            )
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            logger.error("Repository clone failed")
-            return None
+        clone_process = subprocess.run(
+            ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
+            check=True,
+            capture_output=True,
+            text=True
+        )
         
         logger.info("Running Semgrep analysis")
-        try:
-            result = run_command_with_timeout(
-                ["semgrep", "--config=auto", "--json", "."],
-                SEMGREP_TIMEOUT,
-                working_dir=clone_dir
-            )
-            return result.stdout
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            logger.error("Semgrep analysis failed")
-            return None
+        semgrep_process = subprocess.run(
+            ["semgrep", "--config=auto", "--json", "."],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=clone_dir
+        )
+        
+        # Store the results
+        semgrep_output = json.loads(semgrep_process.stdout)
+        analysis_results[repo_name] = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'status': 'completed',
+            'results': semgrep_output
+        }
+        
+        return semgrep_process.stdout
 
     except Exception as e:
-        logger.error(f"Error in Semgrep analysis: {str(e)}")
+        logger.error(f"Error in analysis: {str(e)}")
+        analysis_results[repo_name] = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'status': 'failed',
+            'error': str(e)
+        }
         return None
     finally:
         if clone_dir:
@@ -187,6 +186,66 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}", exc_info=True)
     raise
 
+# API Endpoints
+@app.route('/api/analysis/<owner>/<repo>', methods=['GET'])
+def get_analysis(owner, repo):
+    """Get the latest analysis results for a repository"""
+    repo_name = f"{repo}"
+    
+    if repo_name not in analysis_results:
+        return jsonify({
+            'error': 'No analysis results found for this repository'
+        }), 404
+    
+    return jsonify(analysis_results[repo_name])
+
+@app.route('/api/analysis/<owner>/<repo>/summary', methods=['GET'])
+def get_analysis_summary(owner, repo):
+    """Get a summary of the analysis results"""
+    repo_name = f"{repo}"
+    
+    if repo_name not in analysis_results:
+        return jsonify({
+            'error': 'No analysis results found for this repository'
+        }), 404
+    
+    result = analysis_results[repo_name]
+    
+    if result['status'] != 'completed':
+        return jsonify({
+            'status': result['status'],
+            'timestamp': result['timestamp']
+        })
+    
+    findings = result['results'].get('results', [])
+    
+    # Count findings by severity
+    severity_counts = {}
+    for finding in findings:
+        severity = finding.get('extra', {}).get('severity', 'unknown')
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+    
+    summary = {
+        'status': result['status'],
+        'timestamp': result['timestamp'],
+        'total_findings': len(findings),
+        'findings_by_severity': severity_counts,
+        'scanned_files': result['results'].get('paths', {}).get('scanned', [])
+    }
+    
+    return jsonify(summary)
+
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint - basic API information"""
+    return jsonify({
+        'status': 'running',
+        'endpoints': {
+            '/api/analysis/<owner>/<repo>': 'Get full analysis results',
+            '/api/analysis/<owner>/<repo>/summary': 'Get analysis summary'
+        }
+    })
+
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     """Handle GitHub webhook events"""
@@ -206,7 +265,6 @@ def handle_webhook():
 
         if event_type == 'installation':
             payload = request.json
-            logger.debug("Received installation event payload")
             
             if payload.get('action') not in ['created', 'added']:
                 return jsonify({"message": "Ignored installation action"}), 200
@@ -240,18 +298,17 @@ def handle_webhook():
                     except Exception as e:
                         logger.error(f"Error creating issue in {repo_full_name}: {str(e)}")
 
-            return jsonify({"results": results}), 200
+            return jsonify({
+                "status": "success",
+                "message": "Analysis completed",
+                "results": results
+            }), 200
 
         return jsonify({"message": "Event received"}), 200
 
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT)
