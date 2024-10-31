@@ -96,10 +96,85 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
+def format_semgrep_results(raw_results):
+    """Format Semgrep results into a more frontend-friendly structure"""
+    try:
+        if isinstance(raw_results, str):
+            results = json.loads(raw_results)
+        else:
+            results = raw_results
+
+        formatted_response = {
+            'summary': {
+                'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
+                'total_findings': len(results.get('results', [])),
+                'files_scanned': results.get('paths', {}).get('scanned', []),
+                'semgrep_version': results.get('version'),
+                'scan_status': 'success' if not results.get('errors') else 'completed_with_errors'
+            },
+            'findings': [],
+            'findings_by_severity': {
+                'HIGH': [],
+                'MEDIUM': [],
+                'LOW': [],
+                'WARNING': [],
+                'INFO': []
+            },
+            'findings_by_category': {},
+            'errors': results.get('errors', [])
+        }
+
+        for finding in results.get('results', []):
+            severity = finding.get('extra', {}).get('severity', 'INFO')
+            category = finding.get('extra', {}).get('metadata', {}).get('category', 'uncategorized')
+            
+            formatted_finding = {
+                'id': finding.get('check_id'),
+                'file': finding.get('path'),
+                'line_start': finding.get('start', {}).get('line'),
+                'line_end': finding.get('end', {}).get('line'),
+                'code_snippet': finding.get('extra', {}).get('lines'),
+                'message': finding.get('extra', {}).get('message'),
+                'severity': severity,
+                'category': category,
+                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp'),
+                'fix_recommendations': {
+                    'description': finding.get('extra', {}).get('metadata', {}).get('message'),
+                    'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                }
+            }
+
+            formatted_response['findings'].append(formatted_finding)
+            formatted_response['findings_by_severity'][severity].append(formatted_finding)
+            
+            if category not in formatted_response['findings_by_category']:
+                formatted_response['findings_by_category'][category] = []
+            formatted_response['findings_by_category'][category].append(formatted_finding)
+
+        formatted_response['severity_counts'] = {
+            severity: len(findings)
+            for severity, findings in formatted_response['findings_by_severity'].items()
+        }
+
+        formatted_response['category_counts'] = {
+            category: len(findings)
+            for category, findings in formatted_response['findings_by_category'].items()
+        }
+
+        return formatted_response
+
+    except Exception as e:
+        logger.error(f"Error formatting Semgrep results: {str(e)}")
+        return {
+            'error': 'Failed to format results',
+            'message': str(e)
+        }
+
 def trigger_semgrep_analysis(repo_url, installation_token):
     """Clone repository and run Semgrep scan with proper authentication"""
     clone_dir = None
-    repo_name = repo_url.split('/')[-1].replace('.git', '')
+    repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
     
     try:
         repo_url_with_auth = repo_url.replace(
@@ -107,9 +182,8 @@ def trigger_semgrep_analysis(repo_url, installation_token):
             f"https://x-access-token:{installation_token}@"
         )
         
-        clone_dir = f"/tmp/semgrep_{repo_name}_{os.getpid()}"
+        clone_dir = f"/tmp/semgrep_{repo_name.replace('/', '_')}_{os.getpid()}"
         
-        # Store initial status
         analysis_results[repo_name] = {
             'timestamp': datetime.utcnow().isoformat(),
             'status': 'in_progress',
@@ -135,7 +209,6 @@ def trigger_semgrep_analysis(repo_url, installation_token):
             cwd=clone_dir
         )
         
-        # Store the results
         semgrep_output = json.loads(semgrep_process.stdout)
         analysis_results[repo_name] = {
             'timestamp': datetime.utcnow().isoformat(),
@@ -187,62 +260,64 @@ except Exception as e:
     raise
 
 # API Endpoints
-@app.route('/api/analysis/<owner>/<repo>', methods=['GET'])
-def get_analysis(owner, repo):
-    """Get the latest analysis results for a repository"""
-    repo_name = f"{repo}"
-    
-    if repo_name not in analysis_results:
-        return jsonify({
-            'error': 'No analysis results found for this repository'
-        }), 404
-    
-    return jsonify(analysis_results[repo_name])
-
-@app.route('/api/analysis/<owner>/<repo>/summary', methods=['GET'])
-def get_analysis_summary(owner, repo):
-    """Get a summary of the analysis results"""
-    repo_name = f"{repo}"
-    
-    if repo_name not in analysis_results:
-        return jsonify({
-            'error': 'No analysis results found for this repository'
-        }), 404
-    
-    result = analysis_results[repo_name]
-    
-    if result['status'] != 'completed':
-        return jsonify({
-            'status': result['status'],
-            'timestamp': result['timestamp']
-        })
-    
-    findings = result['results'].get('results', [])
-    
-    # Count findings by severity
-    severity_counts = {}
-    for finding in findings:
-        severity = finding.get('extra', {}).get('severity', 'unknown')
-        severity_counts[severity] = severity_counts.get(severity, 0) + 1
-    
-    summary = {
-        'status': result['status'],
-        'timestamp': result['timestamp'],
-        'total_findings': len(findings),
-        'findings_by_severity': severity_counts,
-        'scanned_files': result['results'].get('paths', {}).get('scanned', [])
-    }
-    
-    return jsonify(summary)
-
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint - basic API information"""
     return jsonify({
         'status': 'running',
         'endpoints': {
-            '/api/analysis/<owner>/<repo>': 'Get full analysis results',
+            '/api/analysis/<owner>/<repo>/formatted': 'Get detailed analysis results',
             '/api/analysis/<owner>/<repo>/summary': 'Get analysis summary'
+        }
+    })
+
+@app.route('/api/analysis/<owner>/<repo>/formatted', methods=['GET'])
+def get_formatted_analysis(owner, repo):
+    """Get formatted analysis results with detailed breakdown"""
+    repo_name = f"{owner}/{repo}"
+    result = analysis_results.get(repo_name)
+    
+    if not result:
+        return jsonify({
+            'error': 'No analysis results found for this repository'
+        }), 404
+    
+    if result.get('results'):
+        formatted_results = format_semgrep_results(result['results'])
+        return jsonify({
+            'repository': repo_name,
+            'timestamp': result['timestamp'],
+            'status': result['status'],
+            'analysis': formatted_results
+        })
+    
+    return jsonify({
+        'error': 'Analysis results are empty or invalid'
+    }), 404
+
+@app.route('/api/analysis/<owner>/<repo>/summary', methods=['GET'])
+def get_analysis_summary(owner, repo):
+    """Get a quick summary of the analysis results"""
+    repo_name = f"{owner}/{repo}"
+    result = analysis_results.get(repo_name)
+    
+    if not result or not result.get('results'):
+        return jsonify({
+            'error': 'No analysis results found for this repository'
+        }), 404
+    
+    formatted_results = format_semgrep_results(result['results'])
+    
+    return jsonify({
+        'repository': repo_name,
+        'timestamp': result['timestamp'],
+        'status': result['status'],
+        'summary': {
+            'total_findings': formatted_results['summary']['total_findings'],
+            'files_scanned': formatted_results['summary']['total_files_scanned'],
+            'severity_counts': formatted_results['severity_counts'],
+            'category_counts': formatted_results['category_counts'],
+            'has_errors': len(formatted_results['errors']) > 0
         }
     })
 
