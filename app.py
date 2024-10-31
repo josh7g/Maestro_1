@@ -24,33 +24,52 @@ logger = logging.getLogger(__name__)
 def format_private_key(key_data):
     """Format the private key correctly."""
     try:
-        # Remove any whitespace
+        # Remove any whitespace and normalize newlines
         key_data = key_data.strip()
         
-        # Log key format for debugging
-        logger.debug(f"Key starts with: {key_data[:50]}")
+        # Log initial format for debugging (safely)
+        logger.debug(f"Initial key starts with: {key_data[:50] if key_data else 'empty'}")
         
-        # If key contains literal '\n', replace with actual newlines
-        if '\\n' in key_data:
-            key_data = key_data.replace('\\n', '\n')
-            
-        # Ensure key has proper header and footer
-        if not key_data.startswith('-----BEGIN RSA PRIVATE KEY-----'):
-            key_data = '-----BEGIN RSA PRIVATE KEY-----\n' + key_data
-        if not key_data.endswith('-----END RSA PRIVATE KEY-----'):
-            key_data = key_data + '\n-----END RSA PRIVATE KEY-----'
-            
-        # Add newline after header and before footer if missing
-        key_data = key_data.replace(
-            '-----BEGIN RSA PRIVATE KEY-----',
-            '-----BEGIN RSA PRIVATE KEY-----\n'
-        )
-        key_data = key_data.replace(
-            '-----END RSA PRIVATE KEY-----',
-            '\n-----END RSA PRIVATE KEY-----'
-        )
+        # Split the key into parts and remove empty lines
+        key_parts = key_data.replace('\\n', '\n').split('\n')
+        key_parts = [part.strip() for part in key_parts if part.strip()]
         
-        return key_data
+        # Reconstruct the key with proper format
+        formatted_key = []
+        
+        # Add header if not present
+        if not key_parts[0].startswith('-----BEGIN RSA PRIVATE KEY-----'):
+            formatted_key.append('-----BEGIN RSA PRIVATE KEY-----')
+        else:
+            formatted_key.append(key_parts[0])
+            key_parts = key_parts[1:]
+        
+        # Add the key body
+        for part in key_parts:
+            if not (part.startswith('----') or part.endswith('----')):
+                formatted_key.append(part)
+        
+        # Add footer if not present
+        if not key_parts[-1].endswith('-----END RSA PRIVATE KEY-----'):
+            formatted_key.append('-----END RSA PRIVATE KEY-----')
+        elif formatted_key[-1] != '-----END RSA PRIVATE KEY-----':
+            formatted_key.append('-----END RSA PRIVATE KEY-----')
+        
+        # Join with newlines
+        result = '\n'.join(formatted_key)
+        
+        # Verify the format
+        if not result.startswith('-----BEGIN RSA PRIVATE KEY-----\n'):
+            result = '-----BEGIN RSA PRIVATE KEY-----\n' + result.replace('-----BEGIN RSA PRIVATE KEY-----', '')
+        if not result.endswith('\n-----END RSA PRIVATE KEY-----'):
+            result = result.replace('-----END RSA PRIVATE KEY-----', '') + '\n-----END RSA PRIVATE KEY-----'
+        
+        # Log the structure (safely)
+        logger.debug(f"Formatted key length: {len(result)}")
+        logger.debug(f"Formatted key starts with: {result.split('\n')[0]}")
+        logger.debug(f"Formatted key ends with: {result.split('\n')[-1]}")
+        
+        return result
         
     except Exception as e:
         logger.error(f"Error formatting private key: {str(e)}")
@@ -138,6 +157,7 @@ try:
     APP_ID = os.getenv('GITHUB_APP_ID')
     if not APP_ID:
         raise ValueError("GITHUB_APP_ID not set")
+    logger.debug(f"APP_ID: {APP_ID}")
     
     WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
     if not WEBHOOK_SECRET:
@@ -151,12 +171,6 @@ try:
     
     # Format the private key
     formatted_key = format_private_key(PRIVATE_KEY)
-    
-    # Log key details for debugging (safely)
-    logger.debug(f"APP_ID: {APP_ID}")
-    logger.debug(f"Private key length: {len(formatted_key)}")
-    logger.debug(f"Key starts with: {formatted_key[:50]}")
-    logger.debug(f"Key ends with: {formatted_key[-50:]}")
     
     # Initialize GitHub Integration
     git_integration = GithubIntegration(
