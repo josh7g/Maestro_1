@@ -103,17 +103,42 @@ def clean_directory(directory):
 def format_semgrep_results(raw_results):
     """Format Semgrep results for frontend"""
     try:
+        # Handle string input
         if isinstance(raw_results, str):
-            results = json.loads(raw_results)
+            try:
+                results = json.loads(raw_results)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON results: {str(e)}")
+                return {
+                    'summary': {
+                        'total_files_scanned': 0,
+                        'total_findings': 0,
+                        'files_scanned': [],
+                        'semgrep_version': 'unknown',
+                        'scan_status': 'failed'
+                    },
+                    'findings': [],
+                    'findings_by_severity': {
+                        'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
+                    },
+                    'findings_by_category': {},
+                    'errors': [f"Failed to parse results: {str(e)}"],
+                    'severity_counts': {},
+                    'category_counts': {}
+                }
         else:
             results = raw_results
+
+        # Validate results structure
+        if not isinstance(results, dict):
+            raise ValueError(f"Invalid results format: expected dict, got {type(results)}")
 
         formatted_response = {
             'summary': {
                 'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
                 'total_findings': len(results.get('results', [])),
                 'files_scanned': results.get('paths', {}).get('scanned', []),
-                'semgrep_version': results.get('version'),
+                'semgrep_version': results.get('version', 'unknown'),
                 'scan_status': 'success' if not results.get('errors') else 'completed_with_errors'
             },
             'findings': [],
@@ -124,34 +149,46 @@ def format_semgrep_results(raw_results):
             'errors': results.get('errors', [])
         }
 
+        # Process findings
         for finding in results.get('results', []):
-            severity = finding.get('extra', {}).get('severity', 'INFO')
-            category = finding.get('extra', {}).get('metadata', {}).get('category', 'uncategorized')
-            
-            formatted_finding = {
-                'id': finding.get('check_id'),
-                'file': finding.get('path'),
-                'line_start': finding.get('start', {}).get('line'),
-                'line_end': finding.get('end', {}).get('line'),
-                'code_snippet': finding.get('extra', {}).get('lines'),
-                'message': finding.get('extra', {}).get('message'),
-                'severity': severity,
-                'category': category,
-                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                'fix_recommendations': {
-                    'description': finding.get('extra', {}).get('metadata', {}).get('message'),
-                    'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+            try:
+                severity = finding.get('extra', {}).get('severity', 'INFO')
+                category = finding.get('extra', {}).get('metadata', {}).get('category', 'uncategorized')
+                
+                formatted_finding = {
+                    'id': finding.get('check_id', 'unknown'),
+                    'file': finding.get('path', 'unknown'),
+                    'line_start': finding.get('start', {}).get('line', 0),
+                    'line_end': finding.get('end', {}).get('line', 0),
+                    'code_snippet': finding.get('extra', {}).get('lines', ''),
+                    'message': finding.get('extra', {}).get('message', ''),
+                    'severity': severity,
+                    'category': category,
+                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                    'fix_recommendations': {
+                        'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
+                        'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                    }
                 }
-            }
 
-            formatted_response['findings'].append(formatted_finding)
-            formatted_response['findings_by_severity'][severity].append(formatted_finding)
-            
-            if category not in formatted_response['findings_by_category']:
-                formatted_response['findings_by_category'][category] = []
-            formatted_response['findings_by_category'][category].append(formatted_finding)
+                formatted_response['findings'].append(formatted_finding)
+                
+                # Ensure severity exists in findings_by_severity
+                if severity not in formatted_response['findings_by_severity']:
+                    formatted_response['findings_by_severity'][severity] = []
+                formatted_response['findings_by_severity'][severity].append(formatted_finding)
+                
+                # Ensure category exists in findings_by_category
+                if category not in formatted_response['findings_by_category']:
+                    formatted_response['findings_by_category'][category] = []
+                formatted_response['findings_by_category'][category].append(formatted_finding)
+                
+            except Exception as e:
+                logger.error(f"Error processing finding: {str(e)}")
+                formatted_response['errors'].append(f"Error processing finding: {str(e)}")
 
+        # Calculate counts
         formatted_response['severity_counts'] = {
             severity: len(findings)
             for severity, findings in formatted_response['findings_by_severity'].items()
@@ -166,10 +203,25 @@ def format_semgrep_results(raw_results):
 
     except Exception as e:
         logger.error(f"Error formatting results: {str(e)}")
-        return {'error': str(e)}
-
-def trigger_semgrep_analysis(repo_url, installation_token):
-    """Run Semgrep analysis"""
+        return {
+            'summary': {
+                'total_files_scanned': 0,
+                'total_findings': 0,
+                'files_scanned': [],
+                'semgrep_version': 'unknown',
+                'scan_status': 'failed'
+            },
+            'findings': [],
+            'findings_by_severity': {
+                'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
+            },
+            'findings_by_category': {},
+            'errors': [f"Failed to format results: {str(e)}"],
+            'severity_counts': {},
+            'category_counts': {}
+        }
+    def trigger_semgrep_analysis(repo_url, installation_token):
+        """Run Semgrep analysis"""
     clone_dir = None
     repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
     
@@ -187,6 +239,7 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         # Use arrays instead of shell=True for security
         clone_cmd = ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir]
         subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
+        logger.info(f"Repository cloned successfully: {repo_name}")
         
         semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
         semgrep_process = subprocess.run(
@@ -197,17 +250,26 @@ def trigger_semgrep_analysis(repo_url, installation_token):
             cwd=clone_dir
         )
         
-        semgrep_output = json.loads(semgrep_process.stdout)
-        analysis_results[repo_name] = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'status': 'completed',
-            'results': semgrep_output
-        }
-        
-        return semgrep_process.stdout
+        try:
+            semgrep_output = json.loads(semgrep_process.stdout)
+            analysis_results[repo_name] = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'status': 'completed',
+                'results': semgrep_output
+            }
+            logger.info(f"Semgrep analysis completed successfully for {repo_name}")
+            return semgrep_process.stdout
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Semgrep output: {str(e)}")
+            analysis_results[repo_name] = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'status': 'failed',
+                'error': f"Invalid Semgrep output: {str(e)}"
+            }
+            return None
 
     except Exception as e:
-        logger.error(f"Analysis error: {str(e)}")
+        logger.error(f"Analysis error for {repo_name}: {str(e)}")
         analysis_results[repo_name] = {
             'timestamp': datetime.utcnow().isoformat(),
             'status': 'failed',
@@ -237,7 +299,6 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
 
-# API Routes
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint - API information"""
@@ -259,6 +320,166 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat()
     })
+
+@app.route('/webhook', methods=['POST'])
+def handle_webhook():
+    """Handle GitHub webhook events"""
+    try:
+        logger.info("Received webhook request")
+        
+        # Verify webhook signature
+        signature = request.headers.get('X-Hub-Signature-256')
+        if not verify_webhook_signature(request.get_data(), signature):
+            logger.error("Invalid webhook signature")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Invalid signature',
+                    'code': 'INVALID_SIGNATURE'
+                }
+            }), 401
+
+        event_type = request.headers.get('X-GitHub-Event', 'ping')
+        logger.info(f"Processing event type: {event_type}")
+
+        if event_type == 'ping':
+            return jsonify({
+                'success': True,
+                'message': 'Webhook configured successfully'
+            })
+
+        if event_type == 'installation':
+            payload = request.json
+            
+            if payload.get('action') not in ['created', 'added']:
+                return jsonify({
+                    'success': True,
+                    'message': 'Event ignored'
+                })
+
+            installation_id = payload['installation']['id']
+            logger.info(f"Processing installation ID: {installation_id}")
+
+            try:
+                installation_token = git_integration.get_access_token(installation_id).token
+                github_client = Github(installation_token)
+            except Exception as e:
+                logger.error(f"Failed to get installation token: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Failed to authenticate with GitHub',
+                        'details': str(e)
+                    }
+                }), 500
+
+            results = {}
+            repositories = payload.get('repositories', [])
+            
+            for repo in repositories:
+                repo_full_name = repo['full_name']
+                repo_url = f"https://github.com/{repo_full_name}.git"
+                
+                logger.info(f"Analyzing repository: {repo_full_name}")
+                semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
+                
+                if semgrep_output:
+                    results[repo_full_name] = semgrep_output
+                    
+                    try:
+                        repo_obj = github_client.get_repo(repo_full_name)
+                        formatted_results = format_semgrep_results(json.loads(semgrep_output))
+                        
+                        if formatted_results.get('errors'):
+                            logger.warning(f"Analysis completed with errors: {formatted_results['errors']}")
+                        
+                        # Create issue body
+                        issue_body = f"""## Semgrep Security Analysis Results
+
+**Scan Summary:**
+- Total Findings: {formatted_results['summary']['total_findings']}
+- Files Scanned: {formatted_results['summary']['total_files_scanned']}
+- Scan Status: {formatted_results['summary']['scan_status']}
+
+**Severity Breakdown:**
+```json
+{json.dumps(formatted_results['severity_counts'], indent=2)}
+```
+
+**Category Breakdown:**
+```json
+{json.dumps(formatted_results['category_counts'], indent=2)}
+```
+
+### Detailed Findings:
+
+"""
+                        # Add findings only if they exist
+                        if formatted_results['findings']:
+                            for i, finding in enumerate(formatted_results['findings'], 1):
+                                issue_body += f"""
+#### {i}. {finding['id']}
+- **Severity:** {finding['severity']}
+- **File:** {finding['file']} (lines {finding['line_start']}-{finding['line_end']})
+- **Issue:** {finding['message']}
+- **Code:**
+```
+{finding['code_snippet']}
+```
+- **Fix Recommendations:** {finding['fix_recommendations']['description']}
+- **References:** {', '.join(finding['fix_recommendations']['references']) if finding['fix_recommendations']['references'] else 'None'}
+
+"""
+                        else:
+                            issue_body += "\nNo security findings were detected in this scan."
+
+                        # Add errors if any
+                        if formatted_results.get('errors'):
+                            issue_body += "\n### Errors During Analysis:\n"
+                            for error in formatted_results['errors']:
+                                issue_body += f"- {error}\n"
+
+                        repo_obj.create_issue(
+                            title=f"Semgrep Security Analysis Results - {datetime.utcnow().strftime('%Y-%m-%d')}",
+                            body=issue_body,
+                            labels=['security', 'semgrep']
+                        )
+                        logger.info(f"Created issue in {repo_full_name}")
+                    except Exception as e:
+                        logger.error(f"Error creating issue in {repo_full_name}: {str(e)}")
+                        # Create a simplified issue if formatting fails
+                        try:
+                            repo_obj.create_issue(
+                                title=f"Semgrep Security Analysis Results (Raw) - {datetime.utcnow().strftime('%Y-%m-%d')}",
+                                body=f"Raw analysis results:\n```json\n{semgrep_output}\n```",
+                                labels=['security', 'semgrep', 'raw-results']
+                            )
+                            logger.info(f"Created raw results issue in {repo_full_name}")
+                        except Exception as e2:
+                            logger.error(f"Failed to create raw results issue: {str(e2)}")
+
+            return jsonify({
+                'success': True,
+                'data': {
+                    'message': 'Analysis completed',
+                    'repositories_analyzed': list(results.keys())
+                }
+            })
+
+        return jsonify({
+            'success': True,
+            'message': 'Event processed'
+        })
+
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Webhook processing failed',
+                'details': str(e)
+            }
+        }), 500
 
 @app.route('/api/v1/analysis/status', methods=['GET'])
 def get_all_analyses():
@@ -406,7 +627,7 @@ def get_analysis_findings(owner, repo):
         return jsonify({
             'success': True,
             'data': {
-                'repository':  {
+                'repository': {
                     'name': repo_name,
                     'owner': owner,
                     'repo': repo
@@ -434,137 +655,6 @@ def get_analysis_findings(owner, repo):
             'success': False,
             'error': {
                 'message': 'Failed to fetch findings',
-                'details': str(e)
-            }
-        }), 500
-
-@app.route('/webhook', methods=['POST'])
-def handle_webhook():
-    """Handle GitHub webhook events"""
-    try:
-        logger.info("Received webhook request")
-        
-        # Verify webhook signature
-        signature = request.headers.get('X-Hub-Signature-256')
-        if not verify_webhook_signature(request.get_data(), signature):
-            logger.error("Invalid webhook signature")
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Invalid signature',
-                    'code': 'INVALID_SIGNATURE'
-                }
-            }), 401
-
-        event_type = request.headers.get('X-GitHub-Event', 'ping')
-        logger.info(f"Processing event type: {event_type}")
-
-        if event_type == 'ping':
-            return jsonify({
-                'success': True,
-                'message': 'Webhook configured successfully'
-            })
-
-        if event_type == 'installation':
-            payload = request.json
-            
-            if payload.get('action') not in ['created', 'added']:
-                return jsonify({
-                    'success': True,
-                    'message': 'Event ignored'
-                })
-
-            installation_id = payload['installation']['id']
-            logger.info(f"Processing installation ID: {installation_id}")
-
-            try:
-                installation_token = git_integration.get_access_token(installation_id).token
-                github_client = Github(installation_token)
-            except Exception as e:
-                logger.error(f"Failed to get installation token: {str(e)}")
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Failed to authenticate with GitHub',
-                        'details': str(e)
-                    }
-                }), 500
-
-            results = {}
-            repositories = payload.get('repositories', [])
-            
-            for repo in repositories:
-                repo_full_name = repo['full_name']
-                repo_url = f"https://github.com/{repo_full_name}.git"
-                
-                logger.info(f"Analyzing repository: {repo_full_name}")
-                semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
-                
-                if semgrep_output:
-                    results[repo_full_name] = semgrep_output
-                    
-                    try:
-                        repo_obj = github_client.get_repo(repo_full_name)
-                        formatted_results = format_semgrep_results(json.loads(semgrep_output))
-                        
-                        # Create a more readable issue body
-                        issue_body = f"""## Semgrep Security Analysis Results
-
-**Scan Summary:**
-- Total Findings: {formatted_results['summary']['total_findings']}
-- Files Scanned: {formatted_results['summary']['total_files_scanned']}
-- Scan Status: {formatted_results['summary']['scan_status']}
-
-**Severity Breakdown:**
-{json.dumps(formatted_results['severity_counts'], indent=2)}
-
-**Category Breakdown:**
-{json.dumps(formatted_results['category_counts'], indent=2)}
-
-### Detailed Findings:
-
-{chr(10).join(f'''
-#### {i+1}. {finding['id']}
-- **Severity:** {finding['severity']}
-- **File:** {finding['file']} (lines {finding['line_start']}-{finding['line_end']})
-- **Issue:** {finding['message']}
-- **Code:**
-```
-{finding['code_snippet']}
-```
-- **Fix Recommendations:** {finding['fix_recommendations']['description']}
-- **References:** {', '.join(finding['fix_recommendations']['references'])}
-''' for i, finding in enumerate(formatted_results['findings']))}
-"""
-                        
-                        repo_obj.create_issue(
-                            title=f"Semgrep Security Analysis Results - {datetime.utcnow().strftime('%Y-%m-%d')}",
-                            body=issue_body,
-                            labels=['security', 'semgrep']
-                        )
-                        logger.info(f"Created issue in {repo_full_name}")
-                    except Exception as e:
-                        logger.error(f"Error creating issue in {repo_full_name}: {str(e)}")
-
-            return jsonify({
-                'success': True,
-                'data': {
-                    'message': 'Analysis completed',
-                    'repositories_analyzed': list(results.keys())
-                }
-            })
-
-        return jsonify({
-            'success': True,
-            'message': 'Event processed'
-        })
-
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Webhook processing failed',
                 'details': str(e)
             }
         }), 500
