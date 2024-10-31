@@ -21,50 +21,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_env_variable(var_name):
-    """Get environment variable or raise exception."""
-    value = os.getenv(var_name)
-    if value is None:
-        raise ValueError(f"Environment variable {var_name} is not set")
-    return value
-
-def format_private_key(key):
-    """Format the private key correctly with improved error handling."""
+def format_private_key(key_data):
+    """Format the private key correctly."""
     try:
-        # Remove any whitespace and newline characters
-        key = key.strip()
+        # Remove any whitespace
+        key_data = key_data.strip()
         
-        # Handle different newline formats
-        if '\\n' in key:
-            key = key.replace('\\n', '\n')
-        if r'\n' in key:
-            key = key.replace(r'\n', '\n')
+        # Log key format for debugging
+        logger.debug(f"Key starts with: {key_data[:50]}")
         
-        # Add header and footer if missing
-        if not key.startswith('-----BEGIN RSA PRIVATE KEY-----'):
-            key = '-----BEGIN RSA PRIVATE KEY-----\n' + key
-        if not key.endswith('-----END RSA PRIVATE KEY-----'):
-            key = key + '\n-----END RSA PRIVATE KEY-----'
+        # If key contains literal '\n', replace with actual newlines
+        if '\\n' in key_data:
+            key_data = key_data.replace('\\n', '\n')
             
-        # Ensure proper line breaks
-        parts = key.split('\n')
-        if len(parts) == 1:
-            # If it's a single line, try to format it properly
-            key_body = parts[0]
-            if '-----BEGIN RSA PRIVATE KEY-----' in key_body:
-                key_body = key_body.replace('-----BEGIN RSA PRIVATE KEY-----', '')
-            if '-----END RSA PRIVATE KEY-----' in key_body:
-                key_body = key_body.replace('-----END RSA PRIVATE KEY-----', '')
+        # Ensure key has proper header and footer
+        if not key_data.startswith('-----BEGIN RSA PRIVATE KEY-----'):
+            key_data = '-----BEGIN RSA PRIVATE KEY-----\n' + key_data
+        if not key_data.endswith('-----END RSA PRIVATE KEY-----'):
+            key_data = key_data + '\n-----END RSA PRIVATE KEY-----'
             
-            formatted_key = (
-                '-----BEGIN RSA PRIVATE KEY-----\n' +
-                key_body + '\n' +
-                '-----END RSA PRIVATE KEY-----'
-            )
-            key = formatted_key
-
-        logger.info("Successfully formatted private key")
-        return key
+        # Add newline after header and before footer if missing
+        key_data = key_data.replace(
+            '-----BEGIN RSA PRIVATE KEY-----',
+            '-----BEGIN RSA PRIVATE KEY-----\n'
+        )
+        key_data = key_data.replace(
+            '-----END RSA PRIVATE KEY-----',
+            '\n-----END RSA PRIVATE KEY-----'
+        )
+        
+        return key_data
         
     except Exception as e:
         logger.error(f"Error formatting private key: {str(e)}")
@@ -147,20 +133,30 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         if clone_dir:
             clean_directory(clone_dir)
 
-# Load configuration with enhanced error handling
+# Load configuration
 try:
-    APP_ID = get_env_variable('GITHUB_APP_ID')
-    WEBHOOK_SECRET = get_env_variable('GITHUB_WEBHOOK_SECRET')
-    PRIVATE_KEY = get_env_variable('GITHUB_APP_PRIVATE_KEY')
-    PORT = int(os.getenv('PORT', 10000))
+    APP_ID = os.getenv('GITHUB_APP_ID')
+    if not APP_ID:
+        raise ValueError("GITHUB_APP_ID not set")
     
-    # Log configuration (safely)
-    logger.info(f"Loaded APP_ID: {APP_ID}")
-    logger.info(f"Webhook secret length: {len(WEBHOOK_SECRET) if WEBHOOK_SECRET else 0}")
-    logger.info(f"Private key length: {len(PRIVATE_KEY) if PRIVATE_KEY else 0}")
+    WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
+    if not WEBHOOK_SECRET:
+        raise ValueError("GITHUB_WEBHOOK_SECRET not set")
+    
+    PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
+    if not PRIVATE_KEY:
+        raise ValueError("GITHUB_APP_PRIVATE_KEY not set")
+    
+    PORT = int(os.getenv('PORT', 10000))
     
     # Format the private key
     formatted_key = format_private_key(PRIVATE_KEY)
+    
+    # Log key details for debugging (safely)
+    logger.debug(f"APP_ID: {APP_ID}")
+    logger.debug(f"Private key length: {len(formatted_key)}")
+    logger.debug(f"Key starts with: {formatted_key[:50]}")
+    logger.debug(f"Key ends with: {formatted_key[-50:]}")
     
     # Initialize GitHub Integration
     git_integration = GithubIntegration(
@@ -170,7 +166,7 @@ try:
     logger.info("Successfully initialized GitHub Integration")
     
 except Exception as e:
-    logger.error(f"Initialization error: {str(e)}", exc_info=True)
+    logger.error(f"Configuration error: {str(e)}", exc_info=True)
     raise
 
 @app.route('/webhook', methods=['POST'])
