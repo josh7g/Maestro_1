@@ -7,6 +7,9 @@ import hashlib
 import shutil
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
+import signal
+from contextlib import contextmanager
+import timeout_decorator
 
 # Load environment variables only in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -21,50 +24,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configure timeout values
+SEMGREP_TIMEOUT = 300  # 5 minutes for Semgrep analysis
+CLONE_TIMEOUT = 60     # 1 minute for git clone
+
+@contextmanager
+def timeout(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    # Register a function to raise a TimeoutError on the signal
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    
+    try:
+        yield
+    finally:
+        # Disable the alarm
+        signal.alarm(0)
+
 def format_private_key(key_data):
     """Format the private key correctly."""
     try:
-        # Remove any whitespace and normalize newlines
         key_data = key_data.strip()
-        
-        # Log initial format for debugging (safely)
         logger.debug("Initial key format check started")
         
-        # Split the key into parts and remove empty lines
         key_parts = key_data.replace('\\n', '\n').split('\n')
         key_parts = [part.strip() for part in key_parts if part.strip()]
         
-        # Reconstruct the key with proper format
         formatted_key = []
         
-        # Add header if not present
         if not key_parts[0].startswith('-----BEGIN RSA PRIVATE KEY-----'):
             formatted_key.append('-----BEGIN RSA PRIVATE KEY-----')
         else:
             formatted_key.append(key_parts[0])
             key_parts = key_parts[1:]
         
-        # Add the key body
         for part in key_parts:
             if not (part.startswith('----') or part.endswith('----')):
                 formatted_key.append(part)
         
-        # Add footer if not present
         if not key_parts[-1].endswith('-----END RSA PRIVATE KEY-----'):
             formatted_key.append('-----END RSA PRIVATE KEY-----')
         elif formatted_key[-1] != '-----END RSA PRIVATE KEY-----':
             formatted_key.append('-----END RSA PRIVATE KEY-----')
         
-        # Join with newlines
         result = '\n'.join(formatted_key)
         
-        # Verify the format
         if not result.startswith('-----BEGIN RSA PRIVATE KEY-----\n'):
             result = '-----BEGIN RSA PRIVATE KEY-----\n' + result.replace('-----BEGIN RSA PRIVATE KEY-----', '')
         if not result.endswith('\n-----END RSA PRIVATE KEY-----'):
             result = result.replace('-----END RSA PRIVATE KEY-----', '') + '\n-----END RSA PRIVATE KEY-----'
         
-        # Log the structure (safely)
         logger.debug(f"Formatted key length: {len(result)}")
         logger.debug("Key formatting completed successfully")
         
@@ -102,42 +113,54 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
+@timeout_decorator.timeout(SEMGREP_TIMEOUT)
+def run_semgrep_analysis(clone_dir):
+    """Run Semgrep analysis with timeout"""
+    return subprocess.run(
+        ["semgrep", "--config=auto", "--json", clone_dir],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+@timeout_decorator.timeout(CLONE_TIMEOUT)
+def clone_repository(repo_url_with_auth, clone_dir):
+    """Clone repository with timeout"""
+    return subprocess.run(
+        ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
+        check=True,
+        capture_output=True,
+        text=True
+    )
+
 def trigger_semgrep_analysis(repo_url, installation_token):
     """Clone repository and run Semgrep scan with proper authentication"""
     clone_dir = None
     try:
-        # Use installation token for authentication
         repo_url_with_auth = repo_url.replace(
             "https://",
             f"https://x-access-token:{installation_token}@"
         )
         
-        # Create unique directory for this analysis
         repo_name = repo_url.split('/')[-1].replace('.git', '')
         clone_dir = f"/tmp/semgrep_{repo_name}_{os.getpid()}"
         
-        # Ensure clean directory
         clean_directory(clone_dir)
         
-        # Clone repository
         logger.info(f"Cloning repository to {clone_dir}")
-        subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-
-        # Run Semgrep analysis
+        try:
+            clone_repository(repo_url_with_auth, clone_dir)
+        except timeout_decorator.TimeoutError:
+            logger.error("Repository clone timed out")
+            return None
+        
         logger.info("Running Semgrep analysis")
-        result = subprocess.run(
-            ["semgrep", "--config=auto", "--json", clone_dir],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-
-        return result.stdout
+        try:
+            result = run_semgrep_analysis(clone_dir)
+            return result.stdout
+        except timeout_decorator.TimeoutError:
+            logger.error("Semgrep analysis timed out")
+            return None
 
     except subprocess.CalledProcessError as e:
         logger.error(f"Command failed: {e.cmd}")
@@ -147,7 +170,6 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         logger.error(f"Error in Semgrep analysis: {str(e)}")
         return None
     finally:
-        # Clean up cloned repository
         if clone_dir:
             clean_directory(clone_dir)
 
@@ -168,10 +190,8 @@ try:
     
     PORT = int(os.getenv('PORT', 10000))
     
-    # Format the private key
     formatted_key = format_private_key(PRIVATE_KEY)
     
-    # Initialize GitHub Integration
     git_integration = GithubIntegration(
         integration_id=int(APP_ID),
         private_key=formatted_key,
@@ -186,16 +206,13 @@ except Exception as e:
 def handle_webhook():
     """Handle GitHub webhook events"""
     try:
-        # Log the incoming request
         logger.debug("Received webhook request")
         
-        # Verify webhook signature
         signature = request.headers.get('X-Hub-Signature-256')
         if not verify_webhook_signature(request.get_data(), signature):
             logger.error("Invalid webhook signature")
             return jsonify({"error": "Invalid signature"}), 401
 
-        # Get event type
         event_type = request.headers.get('X-GitHub-Event', 'ping')
         logger.info(f"Processing event type: {event_type}")
 
@@ -212,7 +229,6 @@ def handle_webhook():
             installation_id = payload['installation']['id']
             logger.info(f"Processing installation ID: {installation_id}")
 
-            # Get installation token
             installation_token = git_integration.get_access_token(installation_id).token
             github_client = Github(installation_token)
 
@@ -229,7 +245,6 @@ def handle_webhook():
                 if semgrep_output:
                     results[repo_full_name] = semgrep_output
                     
-                    # Create issue with results
                     try:
                         repo_obj = github_client.get_repo(repo_full_name)
                         repo_obj.create_issue(
