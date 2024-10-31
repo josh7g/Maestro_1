@@ -14,14 +14,13 @@ if os.getenv('FLASK_ENV') != 'production':
 
 app = Flask(__name__)
 
-# Enhanced logging for Render
+# Enhanced logging for debugging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Configuration with better error handling
 def get_env_variable(var_name):
     """Get environment variable or raise exception."""
     value = os.getenv(var_name)
@@ -29,52 +28,47 @@ def get_env_variable(var_name):
         raise ValueError(f"Environment variable {var_name} is not set")
     return value
 
-try:
-    APP_ID = get_env_variable('GITHUB_APP_ID')
-    WEBHOOK_SECRET = get_env_variable('GITHUB_WEBHOOK_SECRET')
-    PRIVATE_KEY = get_env_variable('GITHUB_APP_PRIVATE_KEY')
-    PORT = int(os.getenv('PORT', 10000))  # Render prefers port 10000
-except ValueError as e:
-    logger.error(f"Configuration error: {str(e)}")
-    raise
-
 def format_private_key(key):
-    """Format the private key correctly."""
+    """Format the private key correctly with improved error handling."""
     try:
-        # Remove any existing whitespace
+        # Remove any whitespace and newline characters
         key = key.strip()
         
-        # If key is already properly formatted, return it
-        if "\n" in key and "-----BEGIN RSA PRIVATE KEY-----" in key:
-            return key
-            
-        # Replace literal \n with actual newlines
+        # Handle different newline formats
         if '\\n' in key:
             key = key.replace('\\n', '\n')
-            
-        # Verify the key format
+        if r'\n' in key:
+            key = key.replace(r'\n', '\n')
+        
+        # Add header and footer if missing
         if not key.startswith('-----BEGIN RSA PRIVATE KEY-----'):
-            raise ValueError("Private key is missing proper header")
+            key = '-----BEGIN RSA PRIVATE KEY-----\n' + key
         if not key.endswith('-----END RSA PRIVATE KEY-----'):
-            raise ValueError("Private key is missing proper footer")
+            key = key + '\n-----END RSA PRIVATE KEY-----'
             
+        # Ensure proper line breaks
+        parts = key.split('\n')
+        if len(parts) == 1:
+            # If it's a single line, try to format it properly
+            key_body = parts[0]
+            if '-----BEGIN RSA PRIVATE KEY-----' in key_body:
+                key_body = key_body.replace('-----BEGIN RSA PRIVATE KEY-----', '')
+            if '-----END RSA PRIVATE KEY-----' in key_body:
+                key_body = key_body.replace('-----END RSA PRIVATE KEY-----', '')
+            
+            formatted_key = (
+                '-----BEGIN RSA PRIVATE KEY-----\n' +
+                key_body + '\n' +
+                '-----END RSA PRIVATE KEY-----'
+            )
+            key = formatted_key
+
+        logger.info("Successfully formatted private key")
         return key
+        
     except Exception as e:
         logger.error(f"Error formatting private key: {str(e)}")
         raise
-
-# Initialize GitHub Integration with better error handling
-try:
-    formatted_key = format_private_key(PRIVATE_KEY)
-    git_integration = GithubIntegration(
-        integration_id=int(APP_ID),
-        private_key=formatted_key,
-    )
-    logger.info("Successfully initialized GitHub Integration")
-except Exception as e:
-    logger.error(f"Failed to initialize GitHub Integration: {str(e)}")
-    logger.error("Please check your private key format and App ID")
-    raise
 
 def verify_webhook_signature(request_data, signature_header):
     """Verify that the webhook signature is valid"""
@@ -153,12 +147,38 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         if clone_dir:
             clean_directory(clone_dir)
 
+# Load configuration with enhanced error handling
+try:
+    APP_ID = get_env_variable('GITHUB_APP_ID')
+    WEBHOOK_SECRET = get_env_variable('GITHUB_WEBHOOK_SECRET')
+    PRIVATE_KEY = get_env_variable('GITHUB_APP_PRIVATE_KEY')
+    PORT = int(os.getenv('PORT', 10000))
+    
+    # Log configuration (safely)
+    logger.info(f"Loaded APP_ID: {APP_ID}")
+    logger.info(f"Webhook secret length: {len(WEBHOOK_SECRET) if WEBHOOK_SECRET else 0}")
+    logger.info(f"Private key length: {len(PRIVATE_KEY) if PRIVATE_KEY else 0}")
+    
+    # Format the private key
+    formatted_key = format_private_key(PRIVATE_KEY)
+    
+    # Initialize GitHub Integration
+    git_integration = GithubIntegration(
+        integration_id=int(APP_ID),
+        private_key=formatted_key,
+    )
+    logger.info("Successfully initialized GitHub Integration")
+    
+except Exception as e:
+    logger.error(f"Initialization error: {str(e)}", exc_info=True)
+    raise
+
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     """Handle GitHub webhook events"""
     try:
         # Log the incoming request
-        logger.info(f"Received webhook. Headers: {dict(request.headers)}")
+        logger.debug(f"Received webhook. Headers: {dict(request.headers)}")
         
         # Verify webhook signature
         signature = request.headers.get('X-Hub-Signature-256')
@@ -170,14 +190,12 @@ def handle_webhook():
         event_type = request.headers.get('X-GitHub-Event', 'ping')
         logger.info(f"Processing event type: {event_type}")
 
-        # Handle ping event
         if event_type == 'ping':
             return jsonify({"message": "Pong!"}), 200
 
-        # Handle installation event
         if event_type == 'installation':
             payload = request.json
-            logger.info(f"Received installation payload: {payload}")
+            logger.debug(f"Received payload: {payload}")
             
             if payload.get('action') not in ['created', 'added']:
                 return jsonify({"message": "Ignored installation action"}), 200
@@ -189,7 +207,6 @@ def handle_webhook():
             installation_token = git_integration.get_access_token(installation_id).token
             github_client = Github(installation_token)
 
-            # Process repositories
             results = {}
             repositories = payload.get('repositories', [])
             
@@ -219,7 +236,7 @@ def handle_webhook():
         return jsonify({"message": "Event received"}), 200
 
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}")
+        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
@@ -228,5 +245,4 @@ def health_check():
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
-    # Use 0.0.0.0 to make the server publicly accessible
     app.run(host='0.0.0.0', port=PORT)
