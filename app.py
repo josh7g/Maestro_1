@@ -1,3 +1,4 @@
+# Part 1: Imports and App Initialization
 from flask import Flask, request, jsonify
 import os
 import subprocess
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Store results in memory
 analysis_results = {}
 
+# Part 2: Helper Functions
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""
     try:
@@ -100,6 +102,7 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
+# Part 3: Main Processing Functions
 def format_semgrep_results(raw_results):
     """Format Semgrep results for frontend"""
     try:
@@ -220,8 +223,9 @@ def format_semgrep_results(raw_results):
             'severity_counts': {},
             'category_counts': {}
         }
-    def trigger_semgrep_analysis(repo_url, installation_token):
-        """Run Semgrep analysis"""
+
+def trigger_semgrep_analysis(repo_url, installation_token):
+    """Run Semgrep analysis"""
     clone_dir = None
     repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
     
@@ -280,7 +284,7 @@ def format_semgrep_results(raw_results):
         if clone_dir:
             clean_directory(clone_dir)
 
-# Load configuration
+# Part 4: Configuration Loading
 try:
     APP_ID = os.getenv('GITHUB_APP_ID')
     WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
@@ -299,6 +303,7 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
 
+# Part 5: Route Handlers
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint - API information"""
