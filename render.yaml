@@ -3,7 +3,7 @@ services:
     name: semgrep-analysis-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn --config gunicorn_config.py app:app
     envVars:
       - key: FLASK_ENV
         value: production
@@ -14,3 +14,8 @@ services:
       - key: GITHUB_APP_PRIVATE_KEY
         sync: false
     healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: tmp
+      mountPath: /tmp
+      sizeGB: 1

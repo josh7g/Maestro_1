@@ -1,6 +1,8 @@
 Flask==3.0.3
-Werkzeug==3.0.1
+Flask-CORS==4.0.0
+PyGithub==2.1.1
 python-dotenv==1.0.1
-PyGithub==2.2.0
 gunicorn==21.2.0
-cryptography==42.0.4
+semgrep==1.56.0
+Werkzeug==3.0.1
+requests==2.31.0
