@@ -28,7 +28,7 @@ def format_private_key(key_data):
         key_data = key_data.strip()
         
         # Log initial format for debugging (safely)
-        logger.debug(f"Initial key starts with: {key_data[:50] if key_data else 'empty'}")
+        logger.debug("Initial key format check started")
         
         # Split the key into parts and remove empty lines
         key_parts = key_data.replace('\\n', '\n').split('\n')
@@ -66,8 +66,7 @@ def format_private_key(key_data):
         
         # Log the structure (safely)
         logger.debug(f"Formatted key length: {len(result)}")
-        logger.debug(f"Formatted key starts with: {result.split('\n')[0]}")
-        logger.debug(f"Formatted key ends with: {result.split('\n')[-1]}")
+        logger.debug("Key formatting completed successfully")
         
         return result
         
@@ -188,7 +187,7 @@ def handle_webhook():
     """Handle GitHub webhook events"""
     try:
         # Log the incoming request
-        logger.debug(f"Received webhook. Headers: {dict(request.headers)}")
+        logger.debug("Received webhook request")
         
         # Verify webhook signature
         signature = request.headers.get('X-Hub-Signature-256')
@@ -205,7 +204,7 @@ def handle_webhook():
 
         if event_type == 'installation':
             payload = request.json
-            logger.debug(f"Received payload: {payload}")
+            logger.debug("Received installation event payload")
             
             if payload.get('action') not in ['created', 'added']:
                 return jsonify({"message": "Ignored installation action"}), 200
