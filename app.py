@@ -26,8 +26,11 @@ class AnalysisResult(db.Model):
         }
 
 # app.py
+
 from flask import Flask, request, jsonify
 import os
+from flask_migrate import Migrate
+from models import db, AnalysisResult
 import subprocess
 import logging
 import hmac
@@ -49,6 +52,7 @@ if os.getenv('FLASK_ENV') != 'production':
 app = Flask(__name__)
 CORS(app)
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO if os.getenv('FLASK_ENV') == 'production' else logging.DEBUG,
@@ -56,14 +60,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database configuration section in app.py
+# Database configuration section 
 DATABASE_URL = os.getenv('DATABASE_URL')
 if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
 # Set a default database URL for development
 if not DATABASE_URL:
-    DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/semgrep_analysis'  
+    DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/semgrep_analysis'
 
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -71,6 +75,15 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Initialize database
 db.init_app(app)
 migrate = Migrate(app, db)
+
+# Create tables at startup
+with app.app_context():
+    try:
+        db.create_all()
+        print("Database tables created successfully!")
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
+
 
 # Helper Functions from original code
 def format_private_key(key_data):
