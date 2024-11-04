@@ -1,43 +1,12 @@
-# models.py
-from datetime import datetime
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.dialects.postgresql import JSON
-
-db = SQLAlchemy()
-
-class AnalysisResult(db.Model):
-    __tablename__ = 'analysis_results'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    repository_name = db.Column(db.String(255), nullable=False, index=True)
-    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    status = db.Column(db.String(50), nullable=False)
-    results = db.Column(JSON)
-    error = db.Column(db.Text)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'repository_name': self.repository_name,
-            'timestamp': self.timestamp.isoformat(),
-            'status': self.status,
-            'results': self.results,
-            'error': self.error
-        }
-
 # app.py
-
 from flask import Flask, request, jsonify
 import os
-from flask_migrate import Migrate
-from models import db, AnalysisResult
 import subprocess
 import logging
 import hmac
 import hashlib
 import shutil
 import json
-import base64
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
 from datetime import datetime
@@ -52,7 +21,6 @@ if os.getenv('FLASK_ENV') != 'production':
 app = Flask(__name__)
 CORS(app)
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO if os.getenv('FLASK_ENV') == 'production' else logging.DEBUG,
@@ -60,12 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database configuration section 
+# Database configuration
 DATABASE_URL = os.getenv('DATABASE_URL')
 if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
-# Set a default database URL for development
 if not DATABASE_URL:
     DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/semgrep_analysis'
 
@@ -80,33 +47,26 @@ migrate = Migrate(app, db)
 with app.app_context():
     try:
         db.create_all()
-        print("Database tables created successfully!")
+        logger.info("Database tables created successfully!")
     except Exception as e:
-        print(f"Error creating database tables: {e}")
+        logger.error(f"Error creating database tables: {e}")
 
-
-# Helper Functions from original code
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""
     try:
         if not key_data:
             raise ValueError("Private key is empty")
         
-        # Remove any whitespace and normalize line endings
         key_data = key_data.strip()
         
-        # Handle different potential formats
         if '\\n' in key_data:
-            # Handle escaped newlines
             parts = key_data.split('\\n')
             key_data = '\n'.join(part.strip() for part in parts if part.strip())
         elif '\n' not in key_data:
-            # Handle single-line key
             key_length = len(key_data)
-            if key_length < 64:  # Minimum size for a valid key
+            if key_length < 64:
                 raise ValueError("Key content too short")
             
-            # Extract the key content and format properly
             if not key_data.startswith('-----BEGIN'):
                 key_data = (
                     '-----BEGIN RSA PRIVATE KEY-----\n' +
@@ -114,13 +74,11 @@ def format_private_key(key_data):
                     '\n-----END RSA PRIVATE KEY-----'
                 )
         
-        # Ensure proper header and footer
         if not key_data.startswith('-----BEGIN RSA PRIVATE KEY-----'):
             key_data = '-----BEGIN RSA PRIVATE KEY-----\n' + key_data
         if not key_data.endswith('-----END RSA PRIVATE KEY-----'):
             key_data = key_data + '\n-----END RSA PRIVATE KEY-----'
         
-        # Validate key format
         lines = key_data.split('\n')
         if len(lines) < 3:
             raise ValueError("Invalid key format - too few lines")
@@ -156,127 +114,6 @@ def clean_directory(directory):
             shutil.rmtree(directory)
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
-
-def format_semgrep_results(raw_results):
-    """Format Semgrep results for frontend"""
-    try:
-        # Handle string input
-        if isinstance(raw_results, str):
-            try:
-                results = json.loads(raw_results)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON results: {str(e)}")
-                return {
-                    'summary': {
-                        'total_files_scanned': 0,
-                        'total_findings': 0,
-                        'files_scanned': [],
-                        'semgrep_version': 'unknown',
-                        'scan_status': 'failed'
-                    },
-                    'findings': [],
-                    'findings_by_severity': {
-                        'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
-                    },
-                    'findings_by_category': {},
-                    'errors': [f"Failed to parse results: {str(e)}"],
-                    'severity_counts': {},
-                    'category_counts': {}
-                }
-        else:
-            results = raw_results
-
-        # Validate results structure
-        if not isinstance(results, dict):
-            raise ValueError(f"Invalid results format: expected dict, got {type(results)}")
-
-        formatted_response = {
-            'summary': {
-                'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
-                'total_findings': len(results.get('results', [])),
-                'files_scanned': results.get('paths', {}).get('scanned', []),
-                'semgrep_version': results.get('version', 'unknown'),
-                'scan_status': 'success' if not results.get('errors') else 'completed_with_errors'
-            },
-            'findings': [],
-            'findings_by_severity': {
-                'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
-            },
-            'findings_by_category': {},
-            'errors': results.get('errors', [])
-        }
-
-        # Process findings
-        for finding in results.get('results', []):
-            try:
-                severity = finding.get('extra', {}).get('severity', 'INFO')
-                category = finding.get('extra', {}).get('metadata', {}).get('category', 'uncategorized')
-                
-                formatted_finding = {
-                    'id': finding.get('check_id', 'unknown'),
-                    'file': finding.get('path', 'unknown'),
-                    'line_start': finding.get('start', {}).get('line', 0),
-                    'line_end': finding.get('end', {}).get('line', 0),
-                    'code_snippet': finding.get('extra', {}).get('lines', ''),
-                    'message': finding.get('extra', {}).get('message', ''),
-                    'severity': severity,
-                    'category': category,
-                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                    'fix_recommendations': {
-                        'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
-                        'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
-                    }
-                }
-
-                formatted_response['findings'].append(formatted_finding)
-                
-                # Ensure severity exists in findings_by_severity
-                if severity not in formatted_response['findings_by_severity']:
-                    formatted_response['findings_by_severity'][severity] = []
-                formatted_response['findings_by_severity'][severity].append(formatted_finding)
-                
-                # Ensure category exists in findings_by_category
-                if category not in formatted_response['findings_by_category']:
-                    formatted_response['findings_by_category'][category] = []
-                formatted_response['findings_by_category'][category].append(formatted_finding)
-                
-            except Exception as e:
-                logger.error(f"Error processing finding: {str(e)}")
-                formatted_response['errors'].append(f"Error processing finding: {str(e)}")
-
-        # Calculate counts
-        formatted_response['severity_counts'] = {
-            severity: len(findings)
-            for severity, findings in formatted_response['findings_by_severity'].items()
-        }
-
-        formatted_response['category_counts'] = {
-            category: len(findings)
-            for category, findings in formatted_response['findings_by_category'].items()
-        }
-
-        return formatted_response
-
-    except Exception as e:
-        logger.error(f"Error formatting results: {str(e)}")
-        return {
-            'summary': {
-                'total_files_scanned': 0,
-                'total_findings': 0,
-                'files_scanned': [],
-                'semgrep_version': 'unknown',
-                'scan_status': 'failed'
-            },
-            'findings': [],
-            'findings_by_severity': {
-                'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
-            },
-            'findings_by_category': {},
-            'errors': [f"Failed to format results: {str(e)}"],
-            'severity_counts': {},
-            'category_counts': {}
-        }
 
 def trigger_semgrep_analysis(repo_url, installation_token):
     """Run Semgrep analysis and save results to database"""
@@ -339,6 +176,122 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         if clone_dir:
             clean_directory(clone_dir)
 
+def format_semgrep_results(raw_results):
+    """Format Semgrep results for frontend"""
+    try:
+        # Handle string input
+        if isinstance(raw_results, str):
+            try:
+                results = json.loads(raw_results)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON results: {str(e)}")
+                return {
+                    'summary': {
+                        'total_files_scanned': 0,
+                        'total_findings': 0,
+                        'files_scanned': [],
+                        'semgrep_version': 'unknown',
+                        'scan_status': 'failed'
+                    },
+                    'findings': [],
+                    'findings_by_severity': {
+                        'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
+                    },
+                    'findings_by_category': {},
+                    'errors': [f"Failed to parse results: {str(e)}"],
+                    'severity_counts': {},
+                    'category_counts': {}
+                }
+        else:
+            results = raw_results
+
+        if not isinstance(results, dict):
+            raise ValueError(f"Invalid results format: expected dict, got {type(results)}")
+
+        formatted_response = {
+            'summary': {
+                'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
+                'total_findings': len(results.get('results', [])),
+                'files_scanned': results.get('paths', {}).get('scanned', []),
+                'semgrep_version': results.get('version', 'unknown'),
+                'scan_status': 'success' if not results.get('errors') else 'completed_with_errors'
+            },
+            'findings': [],
+            'findings_by_severity': {
+                'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
+            },
+            'findings_by_category': {},
+            'errors': results.get('errors', [])
+        }
+
+        for finding in results.get('results', []):
+            try:
+                severity = finding.get('extra', {}).get('severity', 'INFO')
+                category = finding.get('extra', {}).get('metadata', {}).get('category', 'uncategorized')
+                
+                formatted_finding = {
+                    'id': finding.get('check_id', 'unknown'),
+                    'file': finding.get('path', 'unknown'),
+                    'line_start': finding.get('start', {}).get('line', 0),
+                    'line_end': finding.get('end', {}).get('line', 0),
+                    'code_snippet': finding.get('extra', {}).get('lines', ''),
+                    'message': finding.get('extra', {}).get('message', ''),
+                    'severity': severity,
+                    'category': category,
+                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                    'fix_recommendations': {
+                        'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
+                        'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                    }
+                }
+
+                formatted_response['findings'].append(formatted_finding)
+                
+                if severity not in formatted_response['findings_by_severity']:
+                    formatted_response['findings_by_severity'][severity] = []
+                formatted_response['findings_by_severity'][severity].append(formatted_finding)
+                
+                if category not in formatted_response['findings_by_category']:
+                    formatted_response['findings_by_category'][category] = []
+                formatted_response['findings_by_category'][category].append(formatted_finding)
+                
+            except Exception as e:
+                logger.error(f"Error processing finding: {str(e)}")
+                formatted_response['errors'].append(f"Error processing finding: {str(e)}")
+
+        formatted_response['severity_counts'] = {
+            severity: len(findings)
+            for severity, findings in formatted_response['findings_by_severity'].items()
+        }
+
+        formatted_response['category_counts'] = {
+            category: len(findings)
+            for category, findings in formatted_response['findings_by_category'].items()
+        }
+
+        return formatted_response
+
+    except Exception as e:
+        logger.error(f"Error formatting results: {str(e)}")
+        return {
+            'summary': {
+                'total_files_scanned': 0,
+                'total_findings': 0,
+                'files_scanned': [],
+                'semgrep_version': 'unknown',
+                'scan_status': 'failed'
+            },
+            'findings': [],
+            'findings_by_severity': {
+                'HIGH': [], 'MEDIUM': [], 'LOW': [], 'WARNING': [], 'INFO': []
+            },
+            'findings_by_category': {},
+            'errors': [f"Failed to format results: {str(e)}"],
+            'severity_counts': {},
+            'category_counts': {}
+        }
+
 # GitHub App configuration
 try:
     APP_ID = os.getenv('GITHUB_APP_ID')
@@ -357,7 +310,8 @@ try:
 except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
-# Endpoints
+
+# API Routes
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint - API information"""
@@ -421,7 +375,6 @@ def handle_webhook():
 
             try:
                 installation_token = git_integration.get_access_token(installation_id).token
-                github_client = Github(installation_token)
             except Exception as e:
                 logger.error(f"Failed to get installation token: {str(e)}")
                 return jsonify({
@@ -444,66 +397,8 @@ def handle_webhook():
                 
                 if semgrep_output:
                     processed_repos.append(repo_full_name)
+                    logger.info(f"Analysis completed for {repo_full_name}")
                     
-                    try:
-                        repo_obj = github_client.get_repo(repo_full_name)
-                        formatted_results = format_semgrep_results(json.loads(semgrep_output))
-                        
-                        # Create issue body with results
-                        issue_body = f"""## Semgrep Security Analysis Results
-
-**Scan Summary:**
-- Total Findings: {formatted_results['summary']['total_findings']}
-- Files Scanned: {formatted_results['summary']['total_files_scanned']}
-- Scan Status: {formatted_results['summary']['scan_status']}
-
-**Severity Breakdown:**
-```json
-{json.dumps(formatted_results['severity_counts'], indent=2)}
-```
-
-**Category Breakdown:**
-```json
-{json.dumps(formatted_results['category_counts'], indent=2)}
-```
-
-### Detailed Findings:
-
-"""
-                        # Add findings
-                        if formatted_results['findings']:
-                            for i, finding in enumerate(formatted_results['findings'], 1):
-                                issue_body += f"""
-#### {i}. {finding['id']}
-- **Severity:** {finding['severity']}
-- **File:** {finding['file']} (lines {finding['line_start']}-{finding['line_end']})
-- **Issue:** {finding['message']}
-- **Code:**
-```
-{finding['code_snippet']}
-```
-- **Fix Recommendations:** {finding['fix_recommendations']['description']}
-- **References:** {', '.join(finding['fix_recommendations']['references']) if finding['fix_recommendations']['references'] else 'None'}
-
-"""
-                        else:
-                            issue_body += "\nNo security findings were detected in this scan."
-
-                        # Add errors if any
-                        if formatted_results.get('errors'):
-                            issue_body += "\n### Errors During Analysis:\n"
-                            for error in formatted_results['errors']:
-                                issue_body += f"- {error}\n"
-
-                        repo_obj.create_issue(
-                            title=f"Semgrep Security Analysis Results - {datetime.utcnow().strftime('%Y-%m-%d')}",
-                            body=issue_body,
-                            labels=['security', 'semgrep']
-                        )
-                        logger.info(f"Created issue in {repo_full_name}")
-                    except Exception as e:
-                        logger.error(f"Error creating issue in {repo_full_name}: {str(e)}")
-
             return jsonify({
                 'success': True,
                 'data': {
@@ -725,3 +620,4 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     else:
         app.run(host='127.0.0.1', port=port, debug=True)
+
