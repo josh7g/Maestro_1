@@ -474,7 +474,69 @@ def handle_webhook():
                 'details': str(e)
             }
         }), 500
+    
+@app.route('/api/v1/analysis/scan', methods=['POST'])
+def scan_repository():
+    """Scan a specific repository"""
+    try:
+        payload = request.json
+        if not payload or 'owner' not in payload or 'repo' not in payload or 'installation_id' not in payload:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing required fields: owner, repo, and installation_id',
+                    'code': 'INVALID_PAYLOAD'
+                }
+            }), 400
 
+        owner = payload['owner']
+        repo = payload['repo']
+        installation_id = payload['installation_id']
+        repo_name = f"{owner}/{repo}"
+        repo_url = f"https://github.com/{repo_name}.git"
+
+        try:
+            installation_token = git_integration.get_access_token(installation_id).token
+        except Exception as e:
+            logger.error(f"Failed to get installation token: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Invalid installation ID',
+                    'details': str(e)
+                }
+            }), 404
+
+        semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
+        
+        if semgrep_output:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'message': 'Analysis initiated successfully',
+                    'repository': repo_name,
+                    'status': 'completed'
+                }
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Analysis failed',
+                    'code': 'ANALYSIS_FAILED'
+                }
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Scan error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Failed to initiate scan',
+                'details': str(e)
+            }
+        }), 500
+    
 @app.route('/api/v1/analysis/status', methods=['GET'])
 def get_all_analyses():
     """Get status of all analyses with pagination"""
