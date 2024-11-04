@@ -361,10 +361,21 @@ def handle_webhook():
                 'message': 'Webhook configured successfully'
             })
 
-        if event_type == 'installation':
+        # Handle both installation and installation_repositories events
+        if event_type in ['installation', 'installation_repositories']:
             payload = request.json
             
-            if payload.get('action') not in ['created', 'added']:
+            # For installation_repositories, check for 'added' repositories
+            # For installation, check for 'created' or 'added' action
+            valid_actions = ['created', 'added']
+            if event_type == 'installation_repositories':
+                # Check if there are added repositories
+                if not payload.get('repositories_added'):
+                    return jsonify({
+                        'success': True,
+                        'message': 'No repositories added'
+                    })
+            elif payload.get('action') not in valid_actions:
                 return jsonify({
                     'success': True,
                     'message': 'Event ignored'
@@ -385,7 +396,12 @@ def handle_webhook():
                     }
                 }), 500
 
-            repositories = payload.get('repositories', [])
+            # Get repositories based on event type
+            if event_type == 'installation_repositories':
+                repositories = payload.get('repositories_added', [])
+            else:
+                repositories = payload.get('repositories', [])
+
             processed_repos = []
             
             for repo in repositories:
@@ -398,8 +414,45 @@ def handle_webhook():
                 if semgrep_output:
                     processed_repos.append(repo_full_name)
                     logger.info(f"Analysis completed for {repo_full_name}")
-                    
+
             return jsonify({
+                'success': True,
+                'data': {
+                    'message': 'Analysis completed',
+                    'repositories_analyzed': processed_repos
+                }
+            })
+
+        return jsonify({
+            'success': True,
+            'message': 'Event processed'
+        })
+
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Webhook processing failed',
+                'details': str(e)
+            }
+        }), 500
+
+        repositories = payload.get('repositories', [])
+        processed_repos = []
+            
+        for repo in repositories:
+                repo_full_name = repo['full_name']
+                repo_url = f"https://github.com/{repo_full_name}.git"
+                
+                logger.info(f"Analyzing repository: {repo_full_name}")
+                semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
+                
+                if semgrep_output:
+                    processed_repos.append(repo_full_name)
+                    logger.info(f"Analysis completed for {repo_full_name}")
+                    
+        return jsonify({
                 'success': True,
                 'data': {
                     'message': 'Analysis completed',
