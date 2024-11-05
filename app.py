@@ -848,7 +848,120 @@ def get_user_top_vulnerabilities(github_user):
                 'details': str(e)
             }
         }), 500
-    
+@app.route('/api/v1/cleanup/old-scans', methods=['POST'])
+def cleanup_old_scans():
+    """Delete old scans keeping only the latest scan for each repository"""
+    try:
+        with db.session.begin():
+            # Get all distinct repository names
+            distinct_repos = db.session.query(
+                AnalysisResult.repository_name
+            ).distinct().all()
+            
+            deleted_count = 0
+            retained_scans = []
+            
+            for (repo_name,) in distinct_repos:
+                # Get all scans for this repository, ordered by timestamp
+                repo_scans = AnalysisResult.query.filter(
+                    AnalysisResult.repository_name == repo_name
+                ).order_by(
+                    AnalysisResult.timestamp.desc()
+                ).all()
+                
+                if len(repo_scans) > 1:
+                    # Keep the first (latest) scan and delete the rest
+                    latest_scan = repo_scans[0]
+                    retained_scans.append({
+                        'repository': latest_scan.repository_name,
+                        'timestamp': latest_scan.timestamp.isoformat()
+                    })
+                    
+                    # Delete older scans
+                    for old_scan in repo_scans[1:]:
+                        db.session.delete(old_scan)
+                        deleted_count += 1
+            
+            db.session.commit()
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'message': 'Cleanup completed successfully',
+                    'scans_deleted': deleted_count,
+                    'retained_scans': retained_scans
+                }
+            })
+                
+    except Exception as e:
+        logger.error(f"Error during scan cleanup: {str(e)}")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Failed to cleanup old scans',
+                'details': str(e)
+            }
+        }), 500
+
+# Optional: Add an endpoint to cleanup scans for a specific user
+@app.route('/api/v1/users/<github_user>/cleanup-scans', methods=['POST'])
+def cleanup_user_scans(github_user):
+    """Delete old scans for a specific user's repositories"""
+    try:
+        with db.session.begin():
+            # Get all distinct repository names for the user
+            distinct_repos = db.session.query(
+                AnalysisResult.repository_name
+            ).filter(
+                AnalysisResult.repository_name.like(f'{github_user}/%')
+            ).distinct().all()
+            
+            deleted_count = 0
+            retained_scans = []
+            
+            for (repo_name,) in distinct_repos:
+                # Get all scans for this repository, ordered by timestamp
+                repo_scans = AnalysisResult.query.filter(
+                    AnalysisResult.repository_name == repo_name
+                ).order_by(
+                    AnalysisResult.timestamp.desc()
+                ).all()
+                
+                if len(repo_scans) > 1:
+                    # Keep the first (latest) scan and delete the rest
+                    latest_scan = repo_scans[0]
+                    retained_scans.append({
+                        'repository': latest_scan.repository_name,
+                        'timestamp': latest_scan.timestamp.isoformat()
+                    })
+                    
+                    # Delete older scans
+                    for old_scan in repo_scans[1:]:
+                        db.session.delete(old_scan)
+                        deleted_count += 1
+            
+            db.session.commit()
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'message': f'Cleanup completed for user {github_user}',
+                    'scans_deleted': deleted_count,
+                    'retained_scans': retained_scans
+                }
+            })
+                
+    except Exception as e:
+        logger.error(f"Error during user scan cleanup: {str(e)}")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': f'Failed to cleanup scans for user {github_user}',
+                'details': str(e)
+            }
+        }), 500    
 
 if __name__ == '__main__':
     # Create database tables
