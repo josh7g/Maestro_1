@@ -727,7 +727,7 @@ def get_analysis_findings(owner, repo):
 
 @app.route('/api/v1/users/<github_user>/top-vulnerabilities', methods=['GET'])
 def get_user_top_vulnerabilities(github_user):
-    """Get top 5 vulnerabilities for a specific GitHub user"""
+    """Get top 5 vulnerabilities for a specific GitHub user, grouped by repository"""
     try:
         if not github_user:
             return jsonify({
@@ -766,75 +766,88 @@ def get_user_top_vulnerabilities(github_user):
             'INFO': 5      # Lowest priority
         }
 
-        # Aggregate findings from user's repositories
+        # Track repositories and their latest analysis timestamp
+        repo_latest_analysis = {}
         all_findings = []
         
         for analysis in analyses:
-            repo_name = analysis.repository_name.split('/')[1]
-            formatted_results = format_semgrep_results(analysis.results)
-            
-            for finding in formatted_results.get('findings', []):
-                finding['repository'] = {
-                    'name': repo_name,
-                    'full_name': analysis.repository_name,
-                    'analyzed_at': analysis.timestamp.isoformat()
+            repo_name = analysis.repository_name
+            if repo_name not in repo_latest_analysis or analysis.timestamp > repo_latest_analysis[repo_name]['timestamp']:
+                repo_latest_analysis[repo_name] = {
+                    'timestamp': analysis.timestamp,
+                    'findings': []
                 }
-                all_findings.append(finding)
 
-        # Sort findings by severity and other criteria
-        sorted_findings = sorted(
-            all_findings,
-            key=lambda x: (
+        # Aggregate findings from latest analyses only
+        for analysis in analyses:
+            repo_name = analysis.repository_name
+            if analysis.timestamp == repo_latest_analysis[repo_name]['timestamp']:
+                formatted_results = format_semgrep_results(analysis.results)
+                for finding in formatted_results.get('findings', []):
+                    finding['id'] = f"{repo_name.replace('/', '_')}_{finding['vulnerability_id']}_{finding['file']}_{finding['line_range']}"
+                    finding['repository'] = {
+                        'name': repo_name.split('/')[1],
+                        'full_name': repo_name,
+                        'analyzed_at': analysis.timestamp.isoformat()
+                    }
+                    repo_latest_analysis[repo_name]['findings'].append(finding)
+
+        # Sort findings within each repository
+        for repo_data in repo_latest_analysis.values():
+            repo_data['findings'].sort(key=lambda x: (
                 severity_order.get(x['severity'], 999),
                 len(x.get('cwe', [])),
                 len(x.get('owasp', []))
-            )
-        )
+            ))
+            all_findings.extend(repo_data['findings'])
 
-        # Get only the top 5 findings
-        top_5_findings = sorted_findings[:5]
-
-        # Format the response
-        top_vulnerabilities = [{
-            'repository': finding['repository'],
-            'file': finding['file'],
-            'severity': finding['severity'],
-            'message': finding['message'],
-            'code_snippet': finding['code_snippet'],
-            'line_range': f"{finding['line_start']}-{finding['line_end']}",
-            'category': finding['category'],
-            'security_references': {
-                'cwe': finding.get('cwe', []),
-                'owasp': finding.get('owasp', [])
-            },
-            'fix_recommendations': finding.get('fix_recommendations', {
-                'description': '',
-                'references': []
-            }),
-            'vulnerability_id': finding['id']
-        } for finding in top_5_findings]
+        # Format the findings by repository
+        grouped_vulnerabilities = {}
+        for repo_name, repo_data in repo_latest_analysis.items():
+            if repo_data['findings']:
+                formatted_findings = [{
+                    'id': finding['id'],
+                    'file': finding['file'],
+                    'severity': finding['severity'],
+                    'message': finding['message'],
+                    'code_snippet': finding['code_snippet'],
+                    'line_range': f"{finding['line_start']}-{finding['line_end']}",
+                    'category': finding['category'],
+                    'security_references': {
+                        'cwe': finding.get('cwe', []),
+                        'owasp': finding.get('owasp', [])
+                    },
+                    'fix_recommendations': finding.get('fix_recommendations', {
+                        'description': '',
+                        'references': []
+                    }),
+                    'vulnerability_id': finding['vulnerability_id']
+                } for finding in repo_data['findings'][:5]]  # Limit to top 5 per repo
+                
+                if formatted_findings:  # Only include repositories with findings
+                    grouped_vulnerabilities[repo_name] = {
+                        'repository_info': {
+                            'name': repo_name.split('/')[1],
+                            'full_name': repo_name,
+                            'analyzed_at': repo_data['timestamp'].isoformat()
+                        },
+                        'vulnerabilities': formatted_findings
+                    }
 
         return jsonify({
             'success': True,
             'data': {
                 'github_user': github_user,
                 'metadata': {
-                    'total_repositories_analyzed': len(analyses),
-                    'latest_analysis': max(a.timestamp for a in analyses).isoformat(),
+                    'total_repositories_analyzed': len(repo_latest_analysis),
                     'total_vulnerabilities_found': len(all_findings)
                 },
-                'top_vulnerabilities': top_vulnerabilities,
+                'repositories': grouped_vulnerabilities,
                 'summary': {
                     'severity_breakdown': {
                         severity: len([f for f in all_findings if f['severity'] == severity])
                         for severity in severity_order.keys()
-                    },
-                    'repositories_analyzed': [
-                        {
-                            'name': analysis.repository_name,
-                            'last_analyzed': analysis.timestamp.isoformat()
-                        } for analysis in analyses
-                    ]
+                    }
                 }
             }
         })
@@ -848,6 +861,7 @@ def get_user_top_vulnerabilities(github_user):
                 'details': str(e)
             }
         }), 500
+
 @app.route('/api/v1/cleanup/old-scans', methods=['POST'])
 def cleanup_old_scans():
     """Delete old scans keeping only the latest scan for each repository"""
