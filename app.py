@@ -724,6 +724,143 @@ def get_analysis_findings(owner, repo):
                 'details': str(e)
             }
         }), 500
+@app.route('/api/v1/analysis/top-vulnerabilities', methods=['GET'])
+def get_global_top_vulnerabilities():
+    """Get top 5 vulnerabilities across all repositories sorted by severity"""
+    try:
+        # Get all completed analyses
+        analyses = AnalysisResult.query.filter(
+            AnalysisResult.status == 'completed',
+            AnalysisResult.results.isnot(None)  # Ensure we have results
+        ).order_by(
+            AnalysisResult.timestamp.desc()
+        ).all()
+        
+        if not analyses:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'No analyses found',
+                    'code': 'NO_ANALYSES_FOUND'
+                }
+            }), 404
+            
+        # Define severity order for sorting
+        severity_order = {
+            'ERROR': 0,    # Highest priority
+            'HIGH': 1,
+            'MEDIUM': 2,
+            'LOW': 3,
+            'WARNING': 4,
+            'INFO': 5      # Lowest priority
+        }
+        
+        # Aggregate findings from all repositories
+        all_findings = []
+        repositories_affected = {}  # Track which repos are affected by each vulnerability type
+        
+        for analysis in analyses:
+            formatted_results = format_semgrep_results(analysis.results)
+            for finding in formatted_results.get('findings', []):
+                # Create a unique identifier for this type of vulnerability
+                vuln_key = f"{finding['id']}:{finding['severity']}:{finding['message']}"
+                
+                if vuln_key not in repositories_affected:
+                    repositories_affected[vuln_key] = set()
+                
+                repositories_affected[vuln_key].add(analysis.repository_name)
+                
+                # Add repository information to the finding
+                finding['repository'] = {
+                    'name': analysis.repository_name,
+                    'timestamp': analysis.timestamp.isoformat()
+                }
+                all_findings.append(finding)
+        
+        # Sort findings by:
+        # 1. Severity
+        # 2. Number of repositories affected
+        # 3. Number of CWE entries
+        # 4. Number of OWASP entries
+        sorted_findings = sorted(
+            all_findings,
+            key=lambda x: (
+                severity_order.get(x['severity'], 999),
+                -len(repositories_affected[f"{x['id']}:{x['severity']}:{x['message']}"]),  # Negative for descending order
+                len(x.get('cwe', [])),
+                len(x.get('owasp', []))
+            )
+        )
+        
+        # Remove duplicates while keeping the most recent occurrence
+        unique_findings = {}
+        for finding in sorted_findings:
+            vuln_key = f"{finding['id']}:{finding['severity']}:{finding['message']}"
+            if vuln_key not in unique_findings:
+                unique_findings[vuln_key] = finding
+        
+        # Get top 5 unique findings
+        top_findings = list(unique_findings.values())[:5]
+        
+        # Format the response
+        top_vulnerabilities = [{
+            'repository': finding['repository'],
+            'file': finding['file'],
+            'severity': finding['severity'],
+            'message': finding['message'],
+            'code_snippet': finding['code_snippet'],
+            'line_range': f"{finding['line_start']}-{finding['line_end']}",
+            'category': finding['category'],
+            'affected_repositories': list(repositories_affected[f"{finding['id']}:{finding['severity']}:{finding['message']}"]),
+            'affected_repositories_count': len(repositories_affected[f"{finding['id']}:{finding['severity']}:{finding['message']}"]),
+            'security_references': {
+                'cwe': finding.get('cwe', []),
+                'owasp': finding.get('owasp', [])
+            },
+            'fix_recommendations': finding.get('fix_recommendations', {
+                'description': '',
+                'references': []
+            }),
+            'vulnerability_id': finding['id']
+        } for finding in top_findings]
+        
+        # Calculate overall statistics
+        total_repos_analyzed = len(set(analysis.repository_name for analysis in analyses))
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'metadata': {
+                    'total_repositories_analyzed': total_repos_analyzed,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'analysis_timeframe': {
+                        'oldest': min(a.timestamp for a in analyses).isoformat(),
+                        'newest': max(a.timestamp for a in analyses).isoformat()
+                    }
+                },
+                'top_vulnerabilities': top_vulnerabilities,
+                'summary': {
+                    'total_findings_across_repos': len(all_findings),
+                    'repositories_with_vulnerabilities': len(set(
+                        finding['repository']['name'] 
+                        for finding in all_findings
+                    )),
+                    'severity_breakdown': {
+                        severity: len([f for f in all_findings if f['severity'] == severity])
+                        for severity in severity_order.keys()
+                    }
+                }
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting global top vulnerabilities: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Failed to fetch top vulnerabilities',
+                'details': str(e)
+            }
+        }), 500
 
 if __name__ == '__main__':
     # Create database tables
