@@ -756,20 +756,24 @@ def get_user_top_vulnerabilities(github_user):
                 }
             }), 404
 
+        # Add debug logging
+        logger.info(f"Found {len(analyses)} analyses for user {github_user}")
+
         # Define severity order for sorting
         severity_order = {
-            'ERROR': 0,    # Highest priority
+            'ERROR': 0,
             'HIGH': 1,
             'MEDIUM': 2,
             'LOW': 3,
             'WARNING': 4,
-            'INFO': 5      # Lowest priority
+            'INFO': 5
         }
 
         # Track repositories and their latest analysis timestamp
         repo_latest_analysis = {}
         all_findings = []
-        
+
+        # First pass: find latest analysis for each repo
         for analysis in analyses:
             repo_name = analysis.repository_name
             if repo_name not in repo_latest_analysis or analysis.timestamp > repo_latest_analysis[repo_name]['timestamp']:
@@ -777,62 +781,67 @@ def get_user_top_vulnerabilities(github_user):
                     'timestamp': analysis.timestamp,
                     'findings': []
                 }
+                logger.info(f"Latest analysis for {repo_name}: {analysis.timestamp}")
 
-        # Aggregate findings from latest analyses only
+        # Second pass: collect findings from latest analyses only
         for analysis in analyses:
             repo_name = analysis.repository_name
             if analysis.timestamp == repo_latest_analysis[repo_name]['timestamp']:
-                formatted_results = format_semgrep_results(analysis.results)
-                for finding in formatted_results.get('findings', []):
-                    finding['id'] = f"{repo_name.replace('/', '_')}_{finding['vulnerability_id']}_{finding['file']}_{finding['line_range']}"
-                    finding['repository'] = {
-                        'name': repo_name.split('/')[1],
-                        'full_name': repo_name,
-                        'analyzed_at': analysis.timestamp.isoformat()
-                    }
-                    repo_latest_analysis[repo_name]['findings'].append(finding)
+                try:
+                    formatted_results = format_semgrep_results(analysis.results)
+                    logger.info(f"Processing findings for {repo_name}")
+                    
+                    for finding in formatted_results.get('findings', []):
+                        # Debug log the finding structure
+                        logger.debug(f"Raw finding: {finding}")
+                        
+                        # Generate a unique ID using available fields
+                        finding_id = f"{repo_name.replace('/', '_')}_{finding.get('check_id', '')}_{finding.get('file', 'unknown')}_{finding.get('start', {}).get('line', '0')}"
+                        
+                        formatted_finding = {
+                            'id': finding_id,
+                            'file': finding.get('path', finding.get('file', 'unknown')),
+                            'severity': finding.get('extra', {}).get('severity', finding.get('severity', 'UNKNOWN')),
+                            'message': finding.get('extra', {}).get('message', finding.get('message', '')),
+                            'code_snippet': finding.get('extra', {}).get('lines', finding.get('code_snippet', '')),
+                            'line_range': f"{finding.get('start', {}).get('line', '0')}-{finding.get('end', {}).get('line', '0')}",
+                            'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
+                            'security_references': {
+                                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', [])
+                            },
+                            'fix_recommendations': {
+                                'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
+                                'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                            }
+                        }
+                        
+                        repo_latest_analysis[repo_name]['findings'].append(formatted_finding)
+                        all_findings.append(formatted_finding)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing findings for {repo_name}: {str(e)}")
+                    logger.error("Raw results:", analysis.results)
+                    continue
 
         # Sort findings within each repository
         for repo_data in repo_latest_analysis.values():
             repo_data['findings'].sort(key=lambda x: (
-                severity_order.get(x['severity'], 999),
-                len(x.get('cwe', [])),
-                len(x.get('owasp', []))
+                severity_order.get(x['severity'], 999)
             ))
-            all_findings.extend(repo_data['findings'])
 
         # Format the findings by repository
         grouped_vulnerabilities = {}
         for repo_name, repo_data in repo_latest_analysis.items():
             if repo_data['findings']:
-                formatted_findings = [{
-                    'id': finding['id'],
-                    'file': finding['file'],
-                    'severity': finding['severity'],
-                    'message': finding['message'],
-                    'code_snippet': finding['code_snippet'],
-                    'line_range': f"{finding['line_start']}-{finding['line_end']}",
-                    'category': finding['category'],
-                    'security_references': {
-                        'cwe': finding.get('cwe', []),
-                        'owasp': finding.get('owasp', [])
+                grouped_vulnerabilities[repo_name] = {
+                    'repository_info': {
+                        'name': repo_name.split('/')[1],
+                        'full_name': repo_name,
+                        'analyzed_at': repo_data['timestamp'].isoformat()
                     },
-                    'fix_recommendations': finding.get('fix_recommendations', {
-                        'description': '',
-                        'references': []
-                    }),
-                    'vulnerability_id': finding['vulnerability_id']
-                } for finding in repo_data['findings'][:5]]  # Limit to top 5 per repo
-                
-                if formatted_findings:  # Only include repositories with findings
-                    grouped_vulnerabilities[repo_name] = {
-                        'repository_info': {
-                            'name': repo_name.split('/')[1],
-                            'full_name': repo_name,
-                            'analyzed_at': repo_data['timestamp'].isoformat()
-                        },
-                        'vulnerabilities': formatted_findings
-                    }
+                    'vulnerabilities': repo_data['findings'][:5]  # Limit to top 5 per repo
+                }
 
         return jsonify({
             'success': True,
@@ -854,6 +863,7 @@ def get_user_top_vulnerabilities(github_user):
 
     except Exception as e:
         logger.error(f"Error getting user top vulnerabilities: {str(e)}")
+        logger.error("Full traceback:", exc_info=True)
         return jsonify({
             'success': False,
             'error': {
@@ -861,6 +871,37 @@ def get_user_top_vulnerabilities(github_user):
                 'details': str(e)
             }
         }), 500
+
+@app.route('/api/v1/users/<github_user>/debug-findings', methods=['GET'])
+def debug_raw_findings(github_user):
+    """Debug endpoint to see raw findings data"""
+    try:
+        analysis = AnalysisResult.query.filter(
+            AnalysisResult.repository_name.like(f'{github_user}/%')
+        ).order_by(
+            AnalysisResult.timestamp.desc()
+        ).first()
+        
+        if not analysis:
+            return jsonify({
+                'success': False,
+                'error': 'No analysis found'
+            })
+            
+        return jsonify({
+            'success': True,
+            'data': {
+                'repository': analysis.repository_name,
+                'timestamp': analysis.timestamp.isoformat(),
+                'raw_results': analysis.results
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })    
 
 @app.route('/api/v1/cleanup/old-scans', methods=['POST'])
 def cleanup_old_scans():
