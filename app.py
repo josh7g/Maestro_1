@@ -902,121 +902,135 @@ def debug_raw_findings(github_user):
             'success': False,
             'error': str(e)
         })    
-
-@app.route('/api/v1/cleanup/old-scans', methods=['POST'])
-def cleanup_old_scans():
-    """Delete old scans keeping only the latest scan for each repository"""
+@app.route('/api/v1/vulnerabilities/file', methods=['GET'])
+def get_vulnerable_file():
+    """
+    Get the contents of a vulnerable file from GitHub
+    Query parameters:
+    - owner: Repository owner
+    - repo: Repository name
+    - path: File path
+    - installation_id: GitHub App installation ID
+    - line_start: Starting line of vulnerability (optional)
+    - line_end: Ending line of vulnerability (optional)
+    """
     try:
-        with db.session.begin():
-            # Get all distinct repository names
-            distinct_repos = db.session.query(
-                AnalysisResult.repository_name
-            ).distinct().all()
+        # Get query parameters
+        owner = request.args.get('owner')
+        repo = request.args.get('repo')
+        file_path = request.args.get('path')
+        installation_id = request.args.get('installation_id')
+        line_start = request.args.get('line_start', type=int)
+        line_end = request.args.get('line_end', type=int)
+
+        # Validate required parameters
+        if not all([owner, repo, file_path, installation_id]):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing required parameters',
+                    'code': 'MISSING_PARAMETERS'
+                }
+            }), 400
+
+        try:
+            # Get installation token
+            installation_token = git_integration.get_access_token(installation_id).token
+            gh = Github(installation_token)
             
-            deleted_count = 0
-            retained_scans = []
+            # Get repository and file contents
+            repository = gh.get_repo(f"{owner}/{repo}")
+            file_content = repository.get_contents(file_path)
             
-            for (repo_name,) in distinct_repos:
-                # Get all scans for this repository, ordered by timestamp
-                repo_scans = AnalysisResult.query.filter(
-                    AnalysisResult.repository_name == repo_name
-                ).order_by(
-                    AnalysisResult.timestamp.desc()
-                ).all()
+            if not file_content:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'File not found',
+                        'code': 'FILE_NOT_FOUND'
+                    }
+                }), 404
+
+            # Decode content
+            content = file_content.decoded_content.decode('utf-8')
+            lines = content.splitlines()
+            
+            # Get file metadata
+            file_info = {
+                'name': file_content.name,
+                'path': file_content.path,
+                'size': file_content.size,
+                'sha': file_content.sha,
+                'url': file_content.html_url,
+                'total_lines': len(lines)
+            }
+
+            # If line range is specified, extract only those lines
+            if line_start is not None and line_end is not None:
+                # Adjust for 0-based indexing
+                line_start = max(0, line_start - 1)
+                line_end = min(len(lines), line_end)
                 
-                if len(repo_scans) > 1:
-                    # Keep the first (latest) scan and delete the rest
-                    latest_scan = repo_scans[0]
-                    retained_scans.append({
-                        'repository': latest_scan.repository_name,
-                        'timestamp': latest_scan.timestamp.isoformat()
+                # Get context (5 lines before and after)
+                context_start = max(0, line_start - 5)
+                context_end = min(len(lines), line_end + 5)
+                
+                content_lines = lines[context_start:context_end]
+                
+                # Mark the vulnerability range
+                line_markers = []
+                for i in range(len(content_lines)):
+                    actual_line = context_start + i + 1
+                    is_vulnerable = line_start + 1 <= actual_line <= line_end
+                    line_markers.append({
+                        'line_number': actual_line,
+                        'is_vulnerable': is_vulnerable
                     })
-                    
-                    # Delete older scans
-                    for old_scan in repo_scans[1:]:
-                        db.session.delete(old_scan)
-                        deleted_count += 1
-            
-            db.session.commit()
-            
+
+                response_content = '\n'.join(content_lines)
+            else:
+                response_content = content
+                line_markers = [{'line_number': i + 1, 'is_vulnerable': False} for i in range(len(lines))]
+
             return jsonify({
                 'success': True,
                 'data': {
-                    'message': 'Cleanup completed successfully',
-                    'scans_deleted': deleted_count,
-                    'retained_scans': retained_scans
+                    'file_info': file_info,
+                    'content': response_content,
+                    'line_markers': line_markers,
+                    'metadata': {
+                        'repository': {
+                            'owner': owner,
+                            'name': repo,
+                            'full_name': f"{owner}/{repo}"
+                        },
+                        'vulnerability_context': {
+                            'line_start': line_start + 1 if line_start is not None else None,
+                            'line_end': line_end if line_end is not None else None
+                        }
+                    }
                 }
             })
-                
+
+        except Exception as e:
+            logger.error(f"GitHub API error: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Failed to fetch file from GitHub',
+                    'details': str(e)
+                }
+            }), 500
+
     except Exception as e:
-        logger.error(f"Error during scan cleanup: {str(e)}")
-        db.session.rollback()
+        logger.error(f"Error processing request: {str(e)}")
         return jsonify({
             'success': False,
             'error': {
-                'message': 'Failed to cleanup old scans',
+                'message': 'Internal server error',
                 'details': str(e)
             }
         }), 500
-
-# Optional: Add an endpoint to cleanup scans for a specific user
-@app.route('/api/v1/users/<github_user>/cleanup-scans', methods=['POST'])
-def cleanup_user_scans(github_user):
-    """Delete old scans for a specific user's repositories"""
-    try:
-        with db.session.begin():
-            # Get all distinct repository names for the user
-            distinct_repos = db.session.query(
-                AnalysisResult.repository_name
-            ).filter(
-                AnalysisResult.repository_name.like(f'{github_user}/%')
-            ).distinct().all()
-            
-            deleted_count = 0
-            retained_scans = []
-            
-            for (repo_name,) in distinct_repos:
-                # Get all scans for this repository, ordered by timestamp
-                repo_scans = AnalysisResult.query.filter(
-                    AnalysisResult.repository_name == repo_name
-                ).order_by(
-                    AnalysisResult.timestamp.desc()
-                ).all()
-                
-                if len(repo_scans) > 1:
-                    # Keep the first (latest) scan and delete the rest
-                    latest_scan = repo_scans[0]
-                    retained_scans.append({
-                        'repository': latest_scan.repository_name,
-                        'timestamp': latest_scan.timestamp.isoformat()
-                    })
-                    
-                    # Delete older scans
-                    for old_scan in repo_scans[1:]:
-                        db.session.delete(old_scan)
-                        deleted_count += 1
-            
-            db.session.commit()
-            
-            return jsonify({
-                'success': True,
-                'data': {
-                    'message': f'Cleanup completed for user {github_user}',
-                    'scans_deleted': deleted_count,
-                    'retained_scans': retained_scans
-                }
-            })
-                
-    except Exception as e:
-        logger.error(f"Error during user scan cleanup: {str(e)}")
-        db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': f'Failed to cleanup scans for user {github_user}',
-                'details': str(e)
-            }
-        }), 500    
 
 if __name__ == '__main__':
     # Create database tables
