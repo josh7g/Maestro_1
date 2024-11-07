@@ -795,14 +795,34 @@ def get_multiple_users_vulnerabilities():
             }
         }), 500
 
-def process_vulnerabilities(users=None):
+def process_vulnerabilities(users=None, user_id=None):
     """Process vulnerabilities for given users or all repositories if users is empty"""
     try:
+        # Check if user_id column exists
+        column_exists = False
+        try:
+            with db.engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='analysis_results' AND column_name='user_id'
+                """))
+                column_exists = bool(result.scalar())
+        except Exception as e:
+            logger.warning(f"Error checking user_id column: {str(e)}")
+
         # Base query for completed analyses
-        base_query = AnalysisResult.query.filter(
-            AnalysisResult.status == 'completed',
-            AnalysisResult.results.isnot(None)
-        )
+        if column_exists:
+            base_query = db.session.query(AnalysisResult).filter(
+                AnalysisResult.status == 'completed',
+                AnalysisResult.results.isnot(None)
+            )
+        else:
+            # Use raw SQL to avoid the user_id column
+            base_query = db.session.query(AnalysisResult).from_self().filter(
+                AnalysisResult.status == 'completed',
+                AnalysisResult.results.isnot(None)
+            )
 
         # If users are specified, filter by those users
         if users:
@@ -823,7 +843,7 @@ def process_vulnerabilities(users=None):
 
         # Process and format vulnerabilities
         all_vulnerabilities = []
-        seen_vulns = set()  # Track unique vulnerabilities
+        seen_vulns = set()
 
         for analysis in analyses:
             try:
@@ -831,10 +851,8 @@ def process_vulnerabilities(users=None):
                 repo_name = analysis.repository_name
                 
                 for finding in formatted_results.get('findings', []):
-                    # Create a unique identifier for the vulnerability
                     vuln_id = f"{repo_name}_{finding.get('file')}_{finding.get('start', {}).get('line', '0')}"
                     
-                    # Skip if we've already seen this vulnerability
                     if vuln_id in seen_vulns:
                         continue
                     
@@ -869,7 +887,7 @@ def process_vulnerabilities(users=None):
                 logger.error(f"Error processing analysis for {analysis.repository_name}: {str(e)}")
                 continue
 
-        # Sort vulnerabilities by severity and timestamp
+        # Sort vulnerabilities
         severity_order = {
             'ERROR': 0,
             'HIGH': 1,
@@ -906,6 +924,10 @@ def process_vulnerabilities(users=None):
                 'top_vulnerabilities': all_vulnerabilities
             }
         }
+
+        # Add user_id to response only if the column exists
+        if column_exists and user_id:
+            response_data['data']['user_id'] = user_id
 
         return jsonify(response_data)
 
