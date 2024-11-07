@@ -11,14 +11,10 @@ from github import Github, GithubIntegration
 from dotenv import load_dotenv
 from datetime import datetime
 from flask_cors import CORS
-from flask_migrate import Migrate
 from models import db, AnalysisResult
-from sqlalchemy import or_  
-from flask_migrate import upgrade as _upgrade
-from flask_migrate import Migrate, upgrade
+from sqlalchemy import or_
 from sqlalchemy import text
 import traceback
-
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -44,13 +40,16 @@ if not DATABASE_URL:
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Initialize database and migrations
+# Initialize database
 db.init_app(app)
-migrate = Migrate(app, db)
 
 # Initialize database and run migrations
 with app.app_context():
     try:
+        # Create tables if they don't exist
+        db.create_all()
+        logger.info("Database tables created successfully!")
+
         # Test database connection
         db.session.execute(text('SELECT 1'))
         db.session.commit()
@@ -91,6 +90,7 @@ with app.app_context():
         logger.error(traceback.format_exc())
     finally:
         db.session.remove()
+
 
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""
@@ -351,16 +351,6 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
 
-# Run database migrations
-with app.app_context():
-    try:
-        _upgrade()
-        logger.info("Database migrations completed successfully!")
-    except Exception as e:
-        logger.error(f"Error running database migrations: {e}")
-        # Log additional details about the error
-        logger.error(f"Migration error type: {type(e)}")
-        logger.error(f"Migration error details: {str(e)}")
 
 # API Routes
 @app.route('/', methods=['GET'])
