@@ -14,6 +14,7 @@ from flask_cors import CORS
 from flask_migrate import Migrate
 from models import db, AnalysisResult
 from sqlalchemy import or_  
+from flask_migrate import upgrade as _upgrade
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -293,7 +294,6 @@ def format_semgrep_results(raw_results):
             'category_counts': {}
         }
 
-# GitHub App configuration
 try:
     APP_ID = os.getenv('GITHUB_APP_ID')
     WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
@@ -312,6 +312,17 @@ except Exception as e:
     logger.error(f"Configuration error: {str(e)}")
     raise
 
+# Run database migrations
+with app.app_context():
+    try:
+        _upgrade()
+        logger.info("Database migrations completed successfully!")
+    except Exception as e:
+        logger.error(f"Error running database migrations: {e}")
+        # Log additional details about the error
+        logger.error(f"Migration error type: {type(e)}")
+        logger.error(f"Migration error details: {str(e)}")
+
 # API Routes
 @app.route('/', methods=['GET'])
 def root():
@@ -326,15 +337,6 @@ def root():
             '/api/v1/analysis/<owner>/<repo>/findings': 'Get detailed analysis findings'
         }
     }), 200
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Render"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat()
-    })
-
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     """Handle GitHub webhook events"""
@@ -478,14 +480,14 @@ def handle_webhook():
     
 @app.route('/api/v1/analysis/scan', methods=['POST'])
 def scan_repository():
-    """Scan a specific repository"""
+    """Scan a specific repository with user ID"""
     try:
         payload = request.json
-        if not payload or 'owner' not in payload or 'repo' not in payload or 'installation_id' not in payload:
+        if not payload or 'owner' not in payload or 'repo' not in payload or 'installation_id' not in payload or 'user_id' not in payload:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Missing required fields: owner, repo, and installation_id',
+                    'message': 'Missing required fields: owner, repo, installation_id, and user_id',
                     'code': 'INVALID_PAYLOAD'
                 }
             }), 400
@@ -493,6 +495,7 @@ def scan_repository():
         owner = payload['owner']
         repo = payload['repo']
         installation_id = payload['installation_id']
+        user_id = payload['user_id']
         repo_name = f"{owner}/{repo}"
         repo_url = f"https://github.com/{repo_name}.git"
 
@@ -508,7 +511,70 @@ def scan_repository():
                 }
             }), 404
 
-        semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
+        # Update trigger_semgrep_analysis function to include user_id
+        def trigger_semgrep_analysis(repo_url, installation_token, user_id):
+            clone_dir = None
+            repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
+            
+            try:
+                repo_url_with_auth = f"https://x-access-token:{installation_token}@github.com/{repo_name}.git"
+                clone_dir = f"/tmp/semgrep_{repo_name.replace('/', '_')}_{os.getpid()}"
+                
+                # Create initial database entry with user_id
+                analysis = AnalysisResult(
+                    repository_name=repo_name,
+                    user_id=user_id,  # Store the user_id
+                    status='in_progress'
+                )
+                db.session.add(analysis)
+                db.session.commit()
+                
+                clean_directory(clone_dir)
+                
+                clone_cmd = ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir]
+                subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
+                logger.info(f"Repository cloned successfully: {repo_name}")
+                
+                semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
+                semgrep_process = subprocess.run(
+                    semgrep_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=clone_dir
+                )
+                
+                try:
+                    semgrep_output = json.loads(semgrep_process.stdout)
+                    
+                    # Update database entry with results
+                    analysis.status = 'completed'
+                    analysis.results = semgrep_output
+                    db.session.commit()
+                    
+                    logger.info(f"Semgrep analysis completed successfully for {repo_name}")
+                    return semgrep_process.stdout
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse Semgrep output: {str(e)}")
+                    analysis.status = 'failed'
+                    analysis.error = f"Invalid Semgrep output: {str(e)}"
+                    db.session.commit()
+                    return None
+
+            except Exception as e:
+                logger.error(f"Analysis error for {repo_name}: {str(e)}")
+                if 'analysis' in locals():
+                    analysis.status = 'failed'
+                    analysis.error = str(e)
+                    db.session.commit()
+                return None
+            finally:
+                if clone_dir:
+                    clean_directory(clone_dir)
+
+        # Call the updated function with user_id
+        semgrep_output = trigger_semgrep_analysis(repo_url, installation_token, user_id)
         
         if semgrep_output:
             return jsonify({
@@ -516,6 +582,7 @@ def scan_repository():
                 'data': {
                     'message': 'Analysis initiated successfully',
                     'repository': repo_name,
+                    'user_id': user_id,
                     'status': 'completed'
                 }
             })
@@ -534,54 +601,6 @@ def scan_repository():
             'success': False,
             'error': {
                 'message': 'Failed to initiate scan',
-                'details': str(e)
-            }
-        }), 500
-    
-@app.route('/api/v1/analysis/status', methods=['GET'])
-def get_all_analyses():
-    """Get status of all analyses with pagination"""
-    try:
-        page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('limit', 10))
-        
-        pagination = AnalysisResult.query.order_by(
-            AnalysisResult.timestamp.desc()
-        ).paginate(
-            page=page,
-            per_page=per_page,
-            error_out=False
-        )
-        
-        analyses = [{
-            'repository': result.repository_name,
-            'timestamp': result.timestamp.isoformat(),
-            'status': result.status,
-            'error': result.error,
-            'summary': {
-                'total_findings': len(result.results.get('results', [])) if result.results else 0,
-                'status': 'completed' if result.results else 'failed'
-            }
-        } for result in pagination.items]
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'analyses': analyses,
-                'pagination': {
-                    'current_page': page,
-                    'total_pages': pagination.pages,
-                    'total_items': pagination.total,
-                    'per_page': per_page
-                }
-            }
-        })
-    except Exception as e:
-        logger.error(f"Error getting analyses: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Failed to fetch analyses',
                 'details': str(e)
             }
         }), 500

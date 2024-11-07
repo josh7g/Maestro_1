@@ -5,15 +5,18 @@ from sqlalchemy.dialects.postgresql import JSON
 
 db = SQLAlchemy()
 
+# First, let's modify the AnalysisResult model to include user_id
 class AnalysisResult(db.Model):
     __tablename__ = 'analysis_results'
-    
+
     id = db.Column(db.Integer, primary_key=True)
-    repository_name = db.Column(db.String(255), nullable=False, index=True)
-    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    status = db.Column(db.String(50), nullable=False)
-    results = db.Column(JSON)
+    repository_name = db.Column(db.String(255), nullable=False)
+    user_id = db.Column(db.String(255), nullable=True)  # Added user_id field
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    status = db.Column(db.String(50))
+    results = db.Column(db.JSON)
     error = db.Column(db.Text)
+
     
     def to_dict(self):
         return {
@@ -24,3 +27,5 @@ class AnalysisResult(db.Model):
             'results': self.results,
             'error': self.error
         }
+    
+    
