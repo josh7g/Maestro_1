@@ -15,6 +15,10 @@ from flask_migrate import Migrate
 from models import db, AnalysisResult
 from sqlalchemy import or_  
 from flask_migrate import upgrade as _upgrade
+from flask_migrate import Migrate, upgrade
+from sqlalchemy import text
+import traceback
+
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -47,33 +51,19 @@ migrate = Migrate(app, db)
 # Initialize database and run migrations
 with app.app_context():
     try:
-        # Test database connection
-        db.session.execute(text('SELECT 1'))
-        db.session.commit()
-        logger.info("Database connection successful")
-
         # Run migrations
         upgrade()
         logger.info("Database migrations completed successfully!")
 
-        # Verify the user_id column exists
-        try:
-            result = db.session.execute(text("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='analysis_results' AND column_name='user_id'
-            """))
-            if result.scalar():
-                logger.info("user_id column exists in the database")
-            else:
-                logger.warning("user_id column not found in the database")
-        except Exception as column_error:
-            logger.error(f"Error verifying user_id column: {str(column_error)}")
-            logger.error(traceback.format_exc())
+        # Simple database query to verify connection
+        result = db.session.execute("SELECT 1")
+        db.session.commit()
+        logger.info("Database connection verified")
 
     except Exception as e:
         logger.error(f"Database initialization error: {str(e)}")
-        logger.error(traceback.format_exc())
+        # Log the error but don't stop the application
+        logger.error(f"Full error: {traceback.format_exc()}")
     finally:
         db.session.remove()
 

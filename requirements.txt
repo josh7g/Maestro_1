@@ -10,3 +10,5 @@ flask-sqlalchemy==3.1.1
 flask-migrate==4.0.5
 psycopg2-binary==2.9.9
 alembic==1.13.1
+Flask-Migrate
+SQLAlchemy
