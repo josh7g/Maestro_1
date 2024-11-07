@@ -7,8 +7,6 @@ Create Date: 2024-11-07
 """
 from alembic import op
 import sqlalchemy as sa
-from flask_migrate import upgrade as _upgrade, Migrate
-from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision = 'add_user_id_column'
