@@ -30,7 +30,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database configuration
 DATABASE_URL = os.getenv('DATABASE_URL')
 if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
@@ -41,17 +40,42 @@ if not DATABASE_URL:
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Initialize database
+# Initialize database and migrations
 db.init_app(app)
 migrate = Migrate(app, db)
 
-# Create tables at startup
+# Initialize database and run migrations
 with app.app_context():
     try:
-        db.create_all()
-        logger.info("Database tables created successfully!")
+        # Test database connection
+        db.session.execute(text('SELECT 1'))
+        db.session.commit()
+        logger.info("Database connection successful")
+
+        # Run migrations
+        upgrade()
+        logger.info("Database migrations completed successfully!")
+
+        # Verify the user_id column exists
+        try:
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='analysis_results' AND column_name='user_id'
+            """))
+            if result.scalar():
+                logger.info("user_id column exists in the database")
+            else:
+                logger.warning("user_id column not found in the database")
+        except Exception as column_error:
+            logger.error(f"Error verifying user_id column: {str(column_error)}")
+            logger.error(traceback.format_exc())
+
     except Exception as e:
-        logger.error(f"Error creating database tables: {e}")
+        logger.error(f"Database initialization error: {str(e)}")
+        logger.error(traceback.format_exc())
+    finally:
+        db.session.remove()
 
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""
