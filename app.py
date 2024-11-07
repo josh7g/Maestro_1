@@ -56,23 +56,41 @@ with app.app_context():
         db.session.commit()
         logger.info("Database connection successful")
 
+        # Check if user_id column exists
         try:
-            # Run migrations
-            migrate.init_app(app, db, directory='migrations')
-            with app.app_context():
-                upgrade()
-            logger.info("Database migrations completed successfully!")
-        except Exception as migration_error:
-            logger.error(f"Migration error: {str(migration_error)}")
-            # Continue even if migration fails
-            pass
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='analysis_results' AND column_name='user_id'
+            """))
+            column_exists = bool(result.scalar())
+            
+            if not column_exists:
+                # Add user_id column directly
+                logger.info("Adding user_id column...")
+                db.session.execute(text("""
+                    ALTER TABLE analysis_results 
+                    ADD COLUMN IF NOT EXISTS user_id VARCHAR(255)
+                """))
+                # Add index on user_id
+                db.session.execute(text("""
+                    CREATE INDEX IF NOT EXISTS ix_analysis_results_user_id 
+                    ON analysis_results (user_id)
+                """))
+                db.session.commit()
+                logger.info("user_id column added successfully")
+            else:
+                logger.info("user_id column already exists")
+
+        except Exception as column_error:
+            logger.error(f"Error managing user_id column: {str(column_error)}")
+            db.session.rollback()
 
     except Exception as e:
         logger.error(f"Database initialization error: {str(e)}")
         logger.error(traceback.format_exc())
     finally:
         db.session.remove()
-
 
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""
@@ -805,31 +823,11 @@ def get_multiple_users_vulnerabilities():
 def process_vulnerabilities(users=None, user_id=None):
     """Process vulnerabilities for given users or all repositories if users is empty"""
     try:
-        # Check if user_id column exists
-        column_exists = False
-        try:
-            with db.engine.connect() as connection:
-                result = connection.execute(text("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name='analysis_results' AND column_name='user_id'
-                """))
-                column_exists = bool(result.scalar())
-        except Exception as e:
-            logger.warning(f"Error checking user_id column: {str(e)}")
-
         # Base query for completed analyses
-        if column_exists:
-            base_query = db.session.query(AnalysisResult).filter(
-                AnalysisResult.status == 'completed',
-                AnalysisResult.results.isnot(None)
-            )
-        else:
-            # Use raw SQL to avoid the user_id column
-            base_query = db.session.query(AnalysisResult).from_self().filter(
-                AnalysisResult.status == 'completed',
-                AnalysisResult.results.isnot(None)
-            )
+        base_query = db.session.query(AnalysisResult).filter(
+            AnalysisResult.status == 'completed',
+            AnalysisResult.results.isnot(None)
+        )
 
         # If users are specified, filter by those users
         if users:
@@ -837,7 +835,21 @@ def process_vulnerabilities(users=None, user_id=None):
             base_query = base_query.filter(or_(*user_filters))
 
         # Get all analyses ordered by timestamp
-        analyses = base_query.order_by(AnalysisResult.timestamp.desc()).all()
+        try:
+            analyses = base_query.order_by(AnalysisResult.timestamp.desc()).all()
+        except Exception as query_error:
+            if 'user_id' in str(query_error):
+                # If error is about user_id column, try alternative query
+                analyses = db.session.query(
+                    AnalysisResult.repository_name,
+                    AnalysisResult.timestamp,
+                    AnalysisResult.results
+                ).filter(
+                    AnalysisResult.status == 'completed',
+                    AnalysisResult.results.isnot(None)
+                ).order_by(AnalysisResult.timestamp.desc()).all()
+            else:
+                raise
 
         if not analyses:
             return jsonify({
