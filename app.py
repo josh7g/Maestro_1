@@ -132,21 +132,53 @@ def format_private_key(key_data):
         raise ValueError(f"Private key formatting failed: {str(e)}")
 
 def verify_webhook_signature(request_data, signature_header):
-    """Verify webhook signature"""
+    """Verify webhook signature with detailed logging"""
     try:
-        if not WEBHOOK_SECRET or not signature_header:
-            logger.error("Missing webhook secret or signature")
+        # Get webhook secret
+        webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+        
+        # Log verification attempt
+        logger.info("Starting webhook signature verification")
+        
+        if not webhook_secret:
+            logger.error("GITHUB_WEBHOOK_SECRET environment variable is not set")
             return False
 
-        expected_signature = 'sha256=' + hmac.new(
-            WEBHOOK_SECRET.encode('utf-8'),
+        if not signature_header:
+            logger.error("No X-Hub-Signature-256 header received")
+            return False
+
+        # Clean the signature header
+        if signature_header.startswith('sha256='):
+            signature_header = signature_header.replace('sha256=', '')
+        
+        # Calculate expected signature
+        expected_signature = hmac.new(
+            webhook_secret.encode('utf-8'),
             request_data,
             hashlib.sha256
         ).hexdigest()
-        return hmac.compare_digest(expected_signature, signature_header)
+
+        # Debug logging (remove in production)
+        logger.debug(f"Webhook Secret (first 4 chars): {webhook_secret[:4]}...")
+        logger.debug(f"Expected Signature (first 10 chars): {expected_signature[:10]}...")
+        logger.debug(f"Received Signature (first 10 chars): {signature_header[:10]}...")
+        
+        # Compare signatures
+        is_valid = hmac.compare_digest(expected_signature, signature_header)
+        
+        if not is_valid:
+            logger.error("Signature mismatch")
+            logger.error(f"Header format: {request.headers.get('X-Hub-Signature-256')}")
+        else:
+            logger.info("Webhook signature verified successfully")
+            
+        return is_valid
+
     except Exception as e:
         logger.error(f"Signature verification failed: {str(e)}")
         return False
+
 
 def clean_directory(directory):
     """Safely remove a directory"""
@@ -371,11 +403,31 @@ def handle_webhook():
     """Handle GitHub webhook events"""
     try:
         logger.info("Received webhook request")
+        logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
+        logger.info(f"GitHub Event: {request.headers.get('X-GitHub-Event')}")
+        logger.info(f"GitHub Delivery: {request.headers.get('X-GitHub-Delivery')}")
         
-        # Verify webhook signature
+        # Get and verify signature
         signature = request.headers.get('X-Hub-Signature-256')
-        if not verify_webhook_signature(request.get_data(), signature):
-            logger.error("Invalid webhook signature")
+        
+        if not signature:
+            logger.error("No X-Hub-Signature-256 header present")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing signature header',
+                    'code': 'MISSING_SIGNATURE'
+                }
+            }), 401
+
+        # Log raw signature for debugging
+        logger.debug(f"Raw signature header: {signature}")
+        
+        # Get request data once and reuse
+        request_data = request.get_data()
+        
+        # Verify signature
+        if not verify_webhook_signature(request_data, signature):
             return jsonify({
                 'success': False,
                 'error': {
@@ -384,9 +436,14 @@ def handle_webhook():
                 }
             }), 401
 
+        # Log headers for debugging
+        logger.debug("All Headers:")
+        for header, value in request.headers.items():
+            logger.debug(f"{header}: {value}")
+
+        # Process the event
         event_type = request.headers.get('X-GitHub-Event', 'ping')
         logger.info(f"Processing event type: {event_type}")
-
         if event_type == 'ping':
             return jsonify({
                 'success': True,
