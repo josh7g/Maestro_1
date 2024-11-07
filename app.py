@@ -13,6 +13,7 @@ from datetime import datetime
 from flask_cors import CORS
 from flask_migrate import Migrate
 from models import db, AnalysisResult
+from sqlalchemy import or_  
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -724,6 +725,8 @@ def get_analysis_findings(owner, repo):
                 'details': str(e)
             }
         }), 500
+
+
 
 # Keep the original GET endpoint for single user
 @app.route('/api/v1/users/<github_user>/top-vulnerabilities', methods=['GET'])
