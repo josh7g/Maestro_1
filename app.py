@@ -51,21 +51,28 @@ migrate = Migrate(app, db)
 # Initialize database and run migrations
 with app.app_context():
     try:
-        # Run migrations
-        upgrade()
-        logger.info("Database migrations completed successfully!")
-
-        # Simple database query to verify connection
-        result = db.session.execute("SELECT 1")
+        # Test database connection
+        db.session.execute(text('SELECT 1'))
         db.session.commit()
-        logger.info("Database connection verified")
+        logger.info("Database connection successful")
+
+        try:
+            # Run migrations
+            migrate.init_app(app, db, directory='migrations')
+            with app.app_context():
+                upgrade()
+            logger.info("Database migrations completed successfully!")
+        except Exception as migration_error:
+            logger.error(f"Migration error: {str(migration_error)}")
+            # Continue even if migration fails
+            pass
 
     except Exception as e:
         logger.error(f"Database initialization error: {str(e)}")
-        # Log the error but don't stop the application
-        logger.error(f"Full error: {traceback.format_exc()}")
+        logger.error(traceback.format_exc())
     finally:
         db.session.remove()
+
 
 def format_private_key(key_data):
     """Format the private key correctly for GitHub integration"""

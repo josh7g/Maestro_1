@@ -1,10 +1,7 @@
 from logging.config import fileConfig
-
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
-
 from alembic import context
-
 import os
 import sys
 from dotenv import load_dotenv
@@ -18,9 +15,14 @@ from models import db
 # this is the Alembic Config object
 config = context.config
 
-# Interpret the config file for Python logging
+# Setup logging
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    try:
+        fileConfig(config.config_file_name)
+    except Exception as e:
+        print(f"Warning: Error configuring logging: {e}")
+        import logging
+        logging.basicConfig(level=logging.INFO)
 
 # Set SQLAlchemy URL
 config.set_main_option('sqlalchemy.url', os.getenv('DATABASE_URL', '').replace('postgres://', 'postgresql://'))
@@ -43,8 +45,14 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    # Handle the database URL
+    configuration = config.get_section(config.config_ini_section)
+    if not configuration:
+        configuration = {}
+    configuration["sqlalchemy.url"] = config.get_main_option("sqlalchemy.url")
+
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
+        configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
