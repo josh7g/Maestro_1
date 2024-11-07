@@ -725,39 +725,45 @@ def get_analysis_findings(owner, repo):
             }
         }), 500
 
-@app.route('/api/v1/users/<github_user>/top-vulnerabilities', methods=['GET'])
-def get_user_top_vulnerabilities(github_user):
-    """Get top 5 vulnerabilities for a specific GitHub user, grouped by repository"""
+@app.route('/api/v1/users/top-vulnerabilities', methods=['GET'])
+def get_users_top_vulnerabilities():
+    """
+    Get top 5 vulnerabilities for one or multiple GitHub users, grouped by repository
+    Query parameters:
+    - users: Comma-separated list of GitHub usernames or single username
+    - limit: Optional limit of vulnerabilities per repository (default: 5)
+    """
     try:
-        if not github_user:
+        # Get users from query parameter
+        users_param = request.args.get('users')
+        if not users_param:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'GitHub username is required',
+                    'message': 'GitHub username(s) required. Use ?users=user1,user2',
                     'code': 'MISSING_USERNAME'
                 }
             }), 400
 
-        # Get all analyses for the specific user's repositories
-        analyses = AnalysisResult.query.filter(
-            AnalysisResult.status == 'completed',
-            AnalysisResult.results.isnot(None),
-            AnalysisResult.repository_name.like(f'{github_user}/%')
-        ).order_by(
-            AnalysisResult.timestamp.desc()
-        ).all()
-
-        if not analyses:
+        # Parse users and remove any empty strings or whitespace
+        github_users = [user.strip() for user in users_param.split(',') if user.strip()]
+        
+        if not github_users:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': f'No analyses found for user {github_user}',
-                    'code': 'NO_ANALYSES_FOUND'
+                    'message': 'No valid GitHub usernames provided',
+                    'code': 'INVALID_USERNAMES'
                 }
-            }), 404
+            }), 400
 
-        # Add debug logging
-        logger.info(f"Found {len(analyses)} analyses for user {github_user}")
+        # Get optional limit parameter
+        try:
+            vulns_limit = int(request.args.get('limit', 5))
+            if vulns_limit < 1:
+                vulns_limit = 5
+        except ValueError:
+            vulns_limit = 5
 
         # Define severity order for sorting
         severity_order = {
@@ -769,100 +775,145 @@ def get_user_top_vulnerabilities(github_user):
             'INFO': 5
         }
 
-        # Track repositories and their latest analysis timestamp
-        repo_latest_analysis = {}
-        all_findings = []
+        # Store results for all users
+        all_users_data = {}
+        total_repositories = 0
+        total_vulnerabilities = 0
+        combined_severity_counts = {severity: 0 for severity in severity_order.keys()}
 
-        # First pass: find latest analysis for each repo
-        for analysis in analyses:
-            repo_name = analysis.repository_name
-            if repo_name not in repo_latest_analysis or analysis.timestamp > repo_latest_analysis[repo_name]['timestamp']:
-                repo_latest_analysis[repo_name] = {
-                    'timestamp': analysis.timestamp,
-                    'findings': []
-                }
-                logger.info(f"Latest analysis for {repo_name}: {analysis.timestamp}")
+        # Process each user
+        for github_user in github_users:
+            # Get all analyses for the specific user's repositories
+            analyses = AnalysisResult.query.filter(
+                AnalysisResult.status == 'completed',
+                AnalysisResult.results.isnot(None),
+                AnalysisResult.repository_name.like(f'{github_user}/%')
+            ).order_by(
+                AnalysisResult.timestamp.desc()
+            ).all()
 
-        # Second pass: collect findings from latest analyses only
-        for analysis in analyses:
-            repo_name = analysis.repository_name
-            if analysis.timestamp == repo_latest_analysis[repo_name]['timestamp']:
-                try:
-                    formatted_results = format_semgrep_results(analysis.results)
-                    logger.info(f"Processing findings for {repo_name}")
-                    
-                    for finding in formatted_results.get('findings', []):
-                        # Debug log the finding structure
-                        logger.debug(f"Raw finding: {finding}")
+            if not analyses:
+                logger.info(f"No analyses found for user {github_user}")
+                continue
+
+            # Track repositories and their latest analysis timestamp
+            repo_latest_analysis = {}
+            user_findings = []
+
+            # First pass: find latest analysis for each repo
+            for analysis in analyses:
+                repo_name = analysis.repository_name
+                if repo_name not in repo_latest_analysis or analysis.timestamp > repo_latest_analysis[repo_name]['timestamp']:
+                    repo_latest_analysis[repo_name] = {
+                        'timestamp': analysis.timestamp,
+                        'findings': []
+                    }
+
+            # Second pass: collect findings from latest analyses only
+            for analysis in analyses:
+                repo_name = analysis.repository_name
+                if analysis.timestamp == repo_latest_analysis[repo_name]['timestamp']:
+                    try:
+                        formatted_results = format_semgrep_results(analysis.results)
                         
-                        # Generate a unique ID using available fields
-                        finding_id = f"{repo_name.replace('/', '_')}_{finding.get('check_id', '')}_{finding.get('file', 'unknown')}_{finding.get('start', {}).get('line', '0')}"
-                        
-                        formatted_finding = {
-                            'id': finding_id,
-                            'file': finding.get('path', finding.get('file', 'unknown')),
-                            'severity': finding.get('extra', {}).get('severity', finding.get('severity', 'UNKNOWN')),
-                            'message': finding.get('extra', {}).get('message', finding.get('message', '')),
-                            'code_snippet': finding.get('extra', {}).get('lines', finding.get('code_snippet', '')),
-                            'line_range': f"{finding.get('start', {}).get('line', '0')}-{finding.get('end', {}).get('line', '0')}",
-                            'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
-                            'security_references': {
-                                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', [])
-                            },
-                            'fix_recommendations': {
-                                'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
-                                'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                        for finding in formatted_results.get('findings', []):
+                            finding_id = f"{repo_name.replace('/', '_')}_{finding.get('check_id', '')}_{finding.get('file', 'unknown')}_{finding.get('start', {}).get('line', '0')}"
+                            
+                            formatted_finding = {
+                                'id': finding_id,
+                                'file': finding.get('path', finding.get('file', 'unknown')),
+                                'severity': finding.get('extra', {}).get('severity', finding.get('severity', 'UNKNOWN')),
+                                'message': finding.get('extra', {}).get('message', finding.get('message', '')),
+                                'code_snippet': finding.get('extra', {}).get('lines', finding.get('code_snippet', '')),
+                                'line_range': f"{finding.get('start', {}).get('line', '0')}-{finding.get('end', {}).get('line', '0')}",
+                                'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
+                                'security_references': {
+                                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', [])
+                                },
+                                'fix_recommendations': {
+                                    'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
+                                    'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                                }
                             }
-                        }
-                        
-                        repo_latest_analysis[repo_name]['findings'].append(formatted_finding)
-                        all_findings.append(formatted_finding)
-                        
-                except Exception as e:
-                    logger.error(f"Error processing findings for {repo_name}: {str(e)}")
-                    logger.error("Raw results:", analysis.results)
-                    continue
+                            
+                            repo_latest_analysis[repo_name]['findings'].append(formatted_finding)
+                            user_findings.append(formatted_finding)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing findings for {repo_name}: {str(e)}")
+                        continue
 
-        # Sort findings within each repository
-        for repo_data in repo_latest_analysis.values():
-            repo_data['findings'].sort(key=lambda x: (
-                severity_order.get(x['severity'], 999)
-            ))
+            # Sort findings within each repository
+            for repo_data in repo_latest_analysis.values():
+                repo_data['findings'].sort(key=lambda x: (
+                    severity_order.get(x['severity'], 999)
+                ))
 
-        # Format the findings by repository
-        grouped_vulnerabilities = {}
-        for repo_name, repo_data in repo_latest_analysis.items():
-            if repo_data['findings']:
-                grouped_vulnerabilities[repo_name] = {
-                    'repository_info': {
-                        'name': repo_name.split('/')[1],
-                        'full_name': repo_name,
-                        'analyzed_at': repo_data['timestamp'].isoformat()
-                    },
-                    'vulnerabilities': repo_data['findings'][:5]  # Limit to top 5 per repo
+            # Format the findings by repository for this user
+            grouped_vulnerabilities = {}
+            for repo_name, repo_data in repo_latest_analysis.items():
+                if repo_data['findings']:
+                    grouped_vulnerabilities[repo_name] = {
+                        'repository_info': {
+                            'name': repo_name.split('/')[1],
+                            'full_name': repo_name,
+                            'analyzed_at': repo_data['timestamp'].isoformat()
+                        },
+                        'vulnerabilities': repo_data['findings'][:vulns_limit]
+                    }
+
+            # Calculate severity breakdown for this user
+            user_severity_counts = {
+                severity: len([f for f in user_findings if f['severity'] == severity])
+                for severity in severity_order.keys()
+            }
+
+            # Update combined counts
+            for severity, count in user_severity_counts.items():
+                combined_severity_counts[severity] += count
+
+            # Store user data
+            all_users_data[github_user] = {
+                'metadata': {
+                    'repositories_analyzed': len(repo_latest_analysis),
+                    'vulnerabilities_found': len(user_findings)
+                },
+                'repositories': grouped_vulnerabilities,
+                'summary': {
+                    'severity_breakdown': user_severity_counts
                 }
+            }
+
+            # Update totals
+            total_repositories += len(repo_latest_analysis)
+            total_vulnerabilities += len(user_findings)
+
+        # Check if we found any data
+        if not all_users_data:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'No analyses found for any of the provided users',
+                    'code': 'NO_ANALYSES_FOUND'
+                }
+            }), 404
 
         return jsonify({
             'success': True,
             'data': {
-                'github_user': github_user,
-                'metadata': {
-                    'total_repositories_analyzed': len(repo_latest_analysis),
-                    'total_vulnerabilities_found': len(all_findings)
-                },
-                'repositories': grouped_vulnerabilities,
-                'summary': {
-                    'severity_breakdown': {
-                        severity: len([f for f in all_findings if f['severity'] == severity])
-                        for severity in severity_order.keys()
-                    }
+                'users': all_users_data,
+                'overall_summary': {
+                    'total_users_analyzed': len(all_users_data),
+                    'total_repositories_analyzed': total_repositories,
+                    'total_vulnerabilities_found': total_vulnerabilities,
+                    'combined_severity_breakdown': combined_severity_counts
                 }
             }
         })
 
     except Exception as e:
-        logger.error(f"Error getting user top vulnerabilities: {str(e)}")
+        logger.error(f"Error getting users top vulnerabilities: {str(e)}")
         logger.error("Full traceback:", exc_info=True)
         return jsonify({
             'success': False,
