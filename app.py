@@ -195,9 +195,10 @@ def verify_webhook_signature(request_data, signature_header):
         logger.error(traceback.format_exc())
         return False
 
+#Webhook handler
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
-    """Enhanced webhook handler with better error handling and logging"""
+    """Consolidated webhook handler for all GitHub events"""
     try:
         logger.info("Received webhook request")
         logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
@@ -241,7 +242,7 @@ def handle_webhook():
         event_type = request.headers.get('X-GitHub-Event', 'ping')
         logger.info(f"Processing event type: {event_type}")
 
-        # Handle ping event
+        # Handle different event types
         if event_type == 'ping':
             return jsonify({
                 'success': True,
@@ -249,8 +250,7 @@ def handle_webhook():
                 'event_type': 'ping'
             })
 
-        # Add security advisory event handling
-        if event_type == 'security_advisory':
+        elif event_type == 'security_advisory':
             payload = request.json
             if not payload:
                 return jsonify({
@@ -261,50 +261,84 @@ def handle_webhook():
                     }
                 }), 400
                 
-            # Process security advisory
-            try:
-                advisory = payload.get('security_advisory', {})
-                logger.info(f"Processing security advisory: {advisory.get('ghsa_id')}")
-                # Add your security advisory handling logic here
-                
+            advisory = payload.get('security_advisory', {})
+            logger.info(f"Processing security advisory: {advisory.get('ghsa_id')}")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Security advisory processed',
+                'advisory_id': advisory.get('ghsa_id')
+            })
+
+        elif event_type in ['installation', 'installation_repositories']:
+            payload = request.json
+            
+            # For installation_repositories, check for 'added' repositories
+            # For installation, check for 'created' or 'added' action
+            valid_actions = ['created', 'added']
+            if event_type == 'installation_repositories':
+                if not payload.get('repositories_added'):
+                    return jsonify({
+                        'success': True,
+                        'message': 'No repositories added'
+                    })
+            elif payload.get('action') not in valid_actions:
                 return jsonify({
                     'success': True,
-                    'message': 'Security advisory processed',
-                    'advisory_id': advisory.get('ghsa_id')
+                    'message': 'Event ignored'
                 })
+
+            installation_id = payload['installation']['id']
+            logger.info(f"Processing installation ID: {installation_id}")
+
+            try:
+                installation_token = git_integration.get_access_token(installation_id).token
+                
+                # Get repositories based on event type
+                repositories = (
+                    payload.get('repositories_added', []) 
+                    if event_type == 'installation_repositories'
+                    else payload.get('repositories', [])
+                )
+
+                processed_repos = []
+                for repo in repositories:
+                    repo_full_name = repo['full_name']
+                    repo_url = f"https://github.com/{repo_full_name}.git"
+                    
+                    logger.info(f"Analyzing repository: {repo_full_name}")
+                    user_id = payload.get('sender', {}).get('id')
+                    semgrep_output = trigger_semgrep_analysis(
+                        repo_url, 
+                        installation_token,
+                        user_id
+                    )
+                    
+                    if semgrep_output:
+                        processed_repos.append(repo_full_name)
+                        logger.info(f"Analysis completed for {repo_full_name}")
+
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'message': 'Analysis completed',
+                        'repositories_analyzed': processed_repos
+                    }
+                })
+
             except Exception as e:
-                logger.error(f"Error processing security advisory: {str(e)}")
+                logger.error(f"Failed to process installation: {str(e)}")
                 return jsonify({
                     'success': False,
                     'error': {
-                        'message': 'Failed to process security advisory',
+                        'message': 'Failed to process installation',
                         'details': str(e)
                     }
                 }), 500
 
-        # Add debug endpoint for testing
-        if os.getenv('FLASK_ENV') != 'production':
-            @app.route('/debug/test-webhook', methods=['POST'])
-            def test_webhook():
-                try:
-                    webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
-                    raw_data = request.get_data()
-                    received_signature = request.headers.get('X-Hub-Signature-256')
-                    
-                    return jsonify({
-                        'webhook_secret_configured': bool(webhook_secret),
-                        'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
-                        'received_signature': received_signature,
-                        'payload_size': len(raw_data),
-                        'headers': dict(request.headers)
-                    })
-                except Exception as e:
-                    return jsonify({'error': str(e)})
-
         return jsonify({
             'success': True,
-            'message': 'Event processed successfully',
-            'event_type': event_type
+            'message': f'Event {event_type} received and processed'
         })
 
     except Exception as e:
@@ -318,7 +352,33 @@ def handle_webhook():
             }
         }), 500
 
-
+@app.route('/debug/test-webhook', methods=['POST'])
+def test_webhook():
+    """Test endpoint to verify webhook signatures"""
+    if os.getenv('FLASK_ENV') != 'production':
+        try:
+            webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+            raw_data = request.get_data()
+            received_signature = request.headers.get('X-Hub-Signature-256')
+            
+            mac = hmac.new(
+                webhook_secret.encode('utf-8'),
+                msg=raw_data,
+                digestmod=hashlib.sha256
+            )
+            expected_signature = f"sha256={mac.hexdigest()}"
+            
+            return jsonify({
+                'webhook_secret_configured': bool(webhook_secret),
+                'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
+                'received_signature': received_signature,
+                'expected_signature': expected_signature,
+                'payload_size': len(raw_data),
+                'signatures_match': received_signature == expected_signature
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify({'message': 'Not available in production'}), 403
 
 def clean_directory(directory):
     """Safely remove a directory"""
@@ -587,166 +647,6 @@ def root():
             '/api/v1/analysis/<owner>/<repo>/findings': 'Get detailed analysis findings'
         }
     }), 200
-@app.route('/webhook', methods=['POST'])
-def handle_webhook():
-    """Handle GitHub webhook events"""
-    try:
-        logger.info("Received webhook request")
-        logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
-        logger.info(f"GitHub Event: {request.headers.get('X-GitHub-Event')}")
-        logger.info(f"GitHub Delivery: {request.headers.get('X-GitHub-Delivery')}")
-        
-        # Get raw data and signature
-        raw_data = request.get_data()
-        signature = request.headers.get('X-Hub-Signature-256')
-
-        if not signature:
-            logger.error("No X-Hub-Signature-256 header present")
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Missing signature header',
-                    'code': 'MISSING_SIGNATURE'
-                }
-            }), 401
-        
-        # Add debug endpoint to verify the payload and signature
-        if os.getenv('FLASK_ENV') != 'production':
-            logger.debug("Raw payload:")
-            logger.debug(raw_data.decode('utf-8'))
-            
-        # Verify signature
-        if not verify_webhook_signature(raw_data, signature):
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Invalid signature',
-                    'code': 'INVALID_SIGNATURE'
-                }
-            }), 401
-
-        # Process the event
-        event_type = request.headers.get('X-GitHub-Event', 'ping')
-        logger.info(f"Processing event type: {event_type}")
-        if event_type == 'ping':
-            return jsonify({
-                'success': True,
-                'message': 'Webhook configured successfully'
-            })
-
-        # Handle both installation and installation_repositories events
-        if event_type in ['installation', 'installation_repositories']:
-            payload = request.json
-            
-            # For installation_repositories, check for 'added' repositories
-            # For installation, check for 'created' or 'added' action
-            valid_actions = ['created', 'added']
-            if event_type == 'installation_repositories':
-                # Check if there are added repositories
-                if not payload.get('repositories_added'):
-                    return jsonify({
-                        'success': True,
-                        'message': 'No repositories added'
-                    })
-            elif payload.get('action') not in valid_actions:
-                return jsonify({
-                    'success': True,
-                    'message': 'Event ignored'
-                })
-
-            installation_id = payload['installation']['id']
-            logger.info(f"Processing installation ID: {installation_id}")
-
-            try:
-                installation_token = git_integration.get_access_token(installation_id).token
-            except Exception as e:
-                logger.error(f"Failed to get installation token: {str(e)}")
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Failed to authenticate with GitHub',
-                        'details': str(e)
-                    }
-                }), 500
-
-            # Get repositories based on event type
-            if event_type == 'installation_repositories':
-                repositories = payload.get('repositories_added', [])
-            else:
-                repositories = payload.get('repositories', [])
-
-            processed_repos = []
-            
-            for repo in repositories:
-                repo_full_name = repo['full_name']
-                repo_url = f"https://github.com/{repo_full_name}.git"
-                
-                logger.info(f"Analyzing repository: {repo_full_name}")
-                semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
-                
-                if semgrep_output:
-                    processed_repos.append(repo_full_name)
-                    logger.info(f"Analysis completed for {repo_full_name}")
-
-            return jsonify({
-                'success': True,
-                'data': {
-                    'message': 'Analysis completed',
-                    'repositories_analyzed': processed_repos
-                }
-            })
-
-        return jsonify({
-            'success': True,
-            'message': 'Event processed'
-        })
-
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Webhook processing failed',
-                'details': str(e)
-            }
-        }), 500
-
-        repositories = payload.get('repositories', [])
-        processed_repos = []
-            
-        for repo in repositories:
-                repo_full_name = repo['full_name']
-                repo_url = f"https://github.com/{repo_full_name}.git"
-                
-                logger.info(f"Analyzing repository: {repo_full_name}")
-                semgrep_output = trigger_semgrep_analysis(repo_url, installation_token)
-                
-                if semgrep_output:
-                    processed_repos.append(repo_full_name)
-                    logger.info(f"Analysis completed for {repo_full_name}")
-                    
-        return jsonify({
-                'success': True,
-                'data': {
-                    'message': 'Analysis completed',
-                    'repositories_analyzed': processed_repos
-                }
-            })
-
-        return jsonify({
-            'success': True,
-            'message': 'Event processed'
-        })
-
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Webhook processing failed',
-                'details': str(e)
-            }
-        }), 500
     
 @app.route('/api/v1/analysis/scan', methods=['POST'])
 def scan_repository():
