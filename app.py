@@ -130,14 +130,13 @@ def format_private_key(key_data):
     except Exception as e:
         logger.error(f"Error formatting private key: {str(e)}")
         raise ValueError(f"Private key formatting failed: {str(e)}")
-
+        
 def verify_webhook_signature(request_data, signature_header):
     """Verify webhook signature with detailed logging"""
     try:
         # Get webhook secret
         webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
         
-        # Log verification attempt
         logger.info("Starting webhook signature verification")
         
         if not webhook_secret:
@@ -148,28 +147,37 @@ def verify_webhook_signature(request_data, signature_header):
             logger.error("No X-Hub-Signature-256 header received")
             return False
 
-        # Clean the signature header
-        if signature_header.startswith('sha256='):
-            signature_header = signature_header.replace('sha256=', '')
+        # Get the raw signature without 'sha256=' prefix
+        if not signature_header.startswith('sha256='):
+            logger.error("Signature header doesn't start with sha256=")
+            return False
+            
+        received_signature = signature_header.replace('sha256=', '')
         
         # Calculate expected signature
-        expected_signature = hmac.new(
+        mac = hmac.new(
             webhook_secret.encode('utf-8'),
-            request_data,
-            hashlib.sha256
-        ).hexdigest()
-
-        # Debug logging (remove in production)
-        logger.debug(f"Webhook Secret (first 4 chars): {webhook_secret[:4]}...")
-        logger.debug(f"Expected Signature (first 10 chars): {expected_signature[:10]}...")
-        logger.debug(f"Received Signature (first 10 chars): {signature_header[:10]}...")
+            msg=request_data,
+            digestmod=hashlib.sha256
+        )
+        expected_signature = mac.hexdigest()
+        
+        # Log more details for debugging
+        logger.info(f"Request Content-Type: {request.headers.get('Content-Type')}")
+        logger.debug(f"Payload size: {len(request_data)} bytes")
+        logger.debug(f"Expected signature: {expected_signature}")
+        logger.debug(f"Received signature: {received_signature}")
         
         # Compare signatures
-        is_valid = hmac.compare_digest(expected_signature, signature_header)
+        is_valid = hmac.compare_digest(expected_signature, received_signature)
         
         if not is_valid:
             logger.error("Signature mismatch")
-            logger.error(f"Header format: {request.headers.get('X-Hub-Signature-256')}")
+            logger.error(f"Header format: {signature_header}")
+            # Additional debugging info
+            logger.debug("Signature components:")
+            logger.debug(f"- Expected: {expected_signature[:10]}...")
+            logger.debug(f"- Received: {received_signature[:10]}...")
         else:
             logger.info("Webhook signature verified successfully")
             
@@ -177,7 +185,9 @@ def verify_webhook_signature(request_data, signature_header):
 
     except Exception as e:
         logger.error(f"Signature verification failed: {str(e)}")
+        logger.error(traceback.format_exc())
         return False
+
 
 
 def clean_directory(directory):
@@ -407,9 +417,10 @@ def handle_webhook():
         logger.info(f"GitHub Event: {request.headers.get('X-GitHub-Event')}")
         logger.info(f"GitHub Delivery: {request.headers.get('X-GitHub-Delivery')}")
         
-        # Get and verify signature
+        # Get raw data and signature
+        raw_data = request.get_data()
         signature = request.headers.get('X-Hub-Signature-256')
-        
+
         if not signature:
             logger.error("No X-Hub-Signature-256 header present")
             return jsonify({
@@ -419,15 +430,14 @@ def handle_webhook():
                     'code': 'MISSING_SIGNATURE'
                 }
             }), 401
-
-        # Log raw signature for debugging
-        logger.debug(f"Raw signature header: {signature}")
         
-        # Get request data once and reuse
-        request_data = request.get_data()
-        
+        # Add debug endpoint to verify the payload and signature
+        if os.getenv('FLASK_ENV') != 'production':
+            logger.debug("Raw payload:")
+            logger.debug(raw_data.decode('utf-8'))
+            
         # Verify signature
-        if not verify_webhook_signature(request_data, signature):
+        if not verify_webhook_signature(raw_data, signature):
             return jsonify({
                 'success': False,
                 'error': {
@@ -435,11 +445,6 @@ def handle_webhook():
                     'code': 'INVALID_SIGNATURE'
                 }
             }), 401
-
-        # Log headers for debugging
-        logger.debug("All Headers:")
-        for header, value in request.headers.items():
-            logger.debug(f"{header}: {value}")
 
         # Process the event
         event_type = request.headers.get('X-GitHub-Event', 'ping')
