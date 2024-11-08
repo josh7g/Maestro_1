@@ -1217,129 +1217,207 @@ def get_filtered_vulnerabilities():
 @app.route('/api/v1/vulnerabilities/file', methods=['GET'])
 def get_vulnerable_file():
     """
-    Get the contents of a vulnerable file from GitHub
+    Get the contents of vulnerable files for a user with vulnerability details and version info
     Query parameters:
-    - owner: Repository owner
-    - repo: Repository name
-    - path: File path
-    - installation_id: GitHub App installation ID
-    - line_start: Starting line of vulnerability (optional)
-    - line_end: Ending line of vulnerability (optional)
+    - user_id: User ID (required)
+    - repository_name: Repository name (optional) - to filter specific repository
+    - file_path: File path (optional) - to filter specific file
     """
     try:
-        # Get query parameters
-        owner = request.args.get('owner')
-        repo = request.args.get('repo')
-        file_path = request.args.get('path')
-        installation_id = request.args.get('installation_id')
-        line_start = request.args.get('line_start', type=int)
-        line_end = request.args.get('line_end', type=int)
+        user_id = request.args.get('user_id')
+        repository_name = request.args.get('repository_name')
+        file_path = request.args.get('file_path')
 
-        # Validate required parameters
-        if not all([owner, repo, file_path, installation_id]):
+        if not user_id:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Missing required parameters',
-                    'code': 'MISSING_PARAMETERS'
+                    'message': 'Missing user_id parameter',
+                    'code': 'MISSING_USER_ID'
                 }
             }), 400
 
-        try:
-            # Get installation token
-            installation_token = git_integration.get_access_token(installation_id).token
-            gh = Github(installation_token)
-            
-            # Get repository and file contents
-            repository = gh.get_repo(f"{owner}/{repo}")
-            file_content = repository.get_contents(file_path)
-            
-            if not file_content:
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'File not found',
-                        'code': 'FILE_NOT_FOUND'
-                    }
-                }), 404
+        # Query analyses for this user
+        query = db.session.query(AnalysisResult).filter(
+            AnalysisResult.status == 'completed',
+            AnalysisResult.results.isnot(None),
+            AnalysisResult.user_id == user_id
+        )
 
-            # Decode content
-            content = file_content.decoded_content.decode('utf-8')
-            lines = content.splitlines()
-            
-            # Get file metadata
-            file_info = {
-                'name': file_content.name,
-                'path': file_content.path,
-                'size': file_content.size,
-                'sha': file_content.sha,
-                'url': file_content.html_url,
-                'total_lines': len(lines)
-            }
+        if repository_name:
+            query = query.filter(AnalysisResult.repository_name == repository_name)
 
-            # If line range is specified, extract only those lines
-            if line_start is not None and line_end is not None:
-                # Adjust for 0-based indexing
-                line_start = max(0, line_start - 1)
-                line_end = min(len(lines), line_end)
-                
-                # Get context (5 lines before and after)
-                context_start = max(0, line_start - 5)
-                context_end = min(len(lines), line_end + 5)
-                
-                content_lines = lines[context_start:context_end]
-                
-                # Mark the vulnerability range
-                line_markers = []
-                for i in range(len(content_lines)):
-                    actual_line = context_start + i + 1
-                    is_vulnerable = line_start + 1 <= actual_line <= line_end
-                    line_markers.append({
-                        'line_number': actual_line,
-                        'is_vulnerable': is_vulnerable
-                    })
+        analyses = query.order_by(AnalysisResult.timestamp.desc()).all()
 
-                response_content = '\n'.join(content_lines)
-            else:
-                response_content = content
-                line_markers = [{'line_number': i + 1, 'is_vulnerable': False} for i in range(len(lines))]
-
-            return jsonify({
-                'success': True,
-                'data': {
-                    'file_info': file_info,
-                    'content': response_content,
-                    'line_markers': line_markers,
-                    'metadata': {
-                        'repository': {
-                            'owner': owner,
-                            'name': repo,
-                            'full_name': f"{owner}/{repo}"
-                        },
-                        'vulnerability_context': {
-                            'line_start': line_start + 1 if line_start is not None else None,
-                            'line_end': line_end if line_end is not None else None
-                        }
-                    }
-                }
-            })
-
-        except Exception as e:
-            logger.error(f"GitHub API error: {str(e)}")
+        if not analyses:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Failed to fetch file from GitHub',
-                    'details': str(e)
+                    'message': 'No analyses found for this user',
+                    'code': 'NO_ANALYSES_FOUND'
                 }
-            }), 500
+            }), 404
+
+        vulnerable_files = []
+
+        for analysis in analyses:
+            try:
+                # Get repository information
+                owner, repo = analysis.repository_name.split('/')
+                
+                # Get installation token
+                installation_token = git_integration.get_access_token(int(analysis.installation_id)).token
+                gh = Github(installation_token)
+                repository = gh.get_repo(analysis.repository_name)
+                
+                # Get repository version information
+                version_info = {
+                    'latest_tag': None,
+                    'latest_release': None,
+                    'tags': [],
+                    'releases': []
+                }
+
+                # Get tags
+                try:
+                    tags = list(repository.get_tags())
+                    if tags:
+                        version_info['latest_tag'] = {
+                            'name': tags[0].name,
+                            'commit': tags[0].commit.sha,
+                            'date': tags[0].commit.commit.author.date.isoformat()
+                        }
+                        version_info['tags'] = [
+                            {
+                                'name': tag.name,
+                                'commit': tag.commit.sha,
+                                'date': tag.commit.commit.author.date.isoformat()
+                            }
+                            for tag in tags[:5]  # Get latest 5 tags
+                        ]
+                except Exception as tag_error:
+                    logger.error(f"Error getting tags: {str(tag_error)}")
+
+                # Get releases
+                try:
+                    releases = list(repository.get_releases())
+                    if releases:
+                        version_info['latest_release'] = {
+                            'name': releases[0].title,
+                            'tag_name': releases[0].tag_name,
+                            'date': releases[0].created_at.isoformat(),
+                            'is_prerelease': releases[0].prerelease
+                        }
+                        version_info['releases'] = [
+                            {
+                                'name': release.title,
+                                'tag_name': release.tag_name,
+                                'date': release.created_at.isoformat(),
+                                'is_prerelease': release.prerelease
+                            }
+                            for release in releases[:5]  # Get latest 5 releases
+                        ]
+                except Exception as release_error:
+                    logger.error(f"Error getting releases: {str(release_error)}")
+                
+                # Get repository details
+                default_branch = repository.default_branch
+                latest_commit = repository.get_branch(default_branch).commit
+                commit_sha = latest_commit.sha
+                
+                # Process semgrep results for this analysis
+                formatted_results = format_semgrep_results(analysis.results)
+                
+                # Group findings by file
+                files_dict = {}
+                
+                for finding in formatted_results.get('findings', []):
+                    current_file = finding.get('file')
+                    
+                    if file_path and current_file != file_path:
+                        continue
+                        
+                    if current_file not in files_dict:
+                        try:
+                            # Get file content from GitHub
+                            file_content = repository.get_contents(current_file, ref=commit_sha)
+                            content = file_content.decoded_content.decode('utf-8')
+                            lines = content.splitlines()
+                            
+                            files_dict[current_file] = {
+                                'path': current_file,
+                                'content': content,
+                                'total_lines': len(lines),
+                                'repository': {
+                                    'name': repository.name,
+                                    'full_name': repository.full_name,
+                                    'default_branch': default_branch,
+                                    'version_info': version_info,
+                                    'current_commit': {
+                                        'sha': commit_sha,
+                                        'url': f"https://github.com/{repository.full_name}/commit/{commit_sha}",
+                                        'timestamp': latest_commit.commit.author.date.isoformat()
+                                    }
+                                },
+                                'vulnerabilities': []
+                            }
+                        except Exception as file_error:
+                            logger.error(f"Error getting file content: {str(file_error)}")
+                            continue
+                    
+                    # Add vulnerability information
+                    vulnerability_info = {
+                        'type': finding.get('id'),
+                        'severity': finding.get('severity'),
+                        'category': finding.get('category'),
+                        'message': finding.get('message'),
+                        'line_range': {
+                            'start': finding.get('line_start'),
+                            'end': finding.get('line_end')
+                        },
+                        'code_snippet': finding.get('code_snippet'),
+                        'fix_recommendations': finding.get('fix_recommendations', {}),
+                        'security_references': {
+                            'cwe': finding.get('cwe', []),
+                            'owasp': finding.get('owasp', [])
+                        }
+                    }
+                    
+                    files_dict[current_file]['vulnerabilities'].append(vulnerability_info)
+                
+                # Add files to result list
+                for file_info in files_dict.values():
+                    vulnerable_files.append(file_info)
+                    
+            except Exception as analysis_error:
+                logger.error(f"Error processing analysis {analysis.id}: {str(analysis_error)}")
+                continue
+
+        # Sort files by number of vulnerabilities
+        vulnerable_files.sort(
+            key=lambda x: len(x['vulnerabilities']),
+            reverse=True
+        )
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'metadata': {
+                    'user_id': user_id,
+                    'total_files': len(vulnerable_files),
+                    'scan_timestamp': analyses[0].timestamp.isoformat() if analyses else None
+                },
+                'files': vulnerable_files
+            }
+        })
 
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
+        logger.error(f"Error getting vulnerable files: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'success': False,
             'error': {
-                'message': 'Internal server error',
+                'message': 'Failed to get vulnerable files',
                 'details': str(e)
             }
         }), 500
