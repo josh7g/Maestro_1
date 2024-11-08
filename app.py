@@ -198,8 +198,8 @@ def clean_directory(directory):
     except Exception as e:
         logger.error(f"Error cleaning directory {directory}: {str(e)}")
 
-def trigger_semgrep_analysis(repo_url, installation_token):
-    """Run Semgrep analysis and save results to database"""
+def trigger_semgrep_analysis(repo_url, installation_token, user_id):
+    """Run Semgrep analysis with enhanced error handling"""
     clone_dir = None
     repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
     
@@ -210,43 +210,91 @@ def trigger_semgrep_analysis(repo_url, installation_token):
         # Create initial database entry
         analysis = AnalysisResult(
             repository_name=repo_name,
+            user_id=user_id,
             status='in_progress'
         )
         db.session.add(analysis)
         db.session.commit()
+        logger.info(f"Created analysis record with ID: {analysis.id}")
         
+        # Clean directory first
         clean_directory(clone_dir)
+        logger.info(f"Cloning repository to {clone_dir}")
         
-        clone_cmd = ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir]
-        subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
-        logger.info(f"Repository cloned successfully: {repo_name}")
-        
-        semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
-        semgrep_process = subprocess.run(
-            semgrep_cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=clone_dir
-        )
-        
+        # Enhanced clone command with detailed error capture
         try:
-            semgrep_output = json.loads(semgrep_process.stdout)
+            # First verify the repository exists and is accessible
+            test_url = f"https://api.github.com/repos/{repo_name}"
+            headers = {
+                'Authorization': f'Bearer {installation_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
             
-            # Update database entry with results
-            analysis.status = 'completed'
-            analysis.results = semgrep_output
-            db.session.commit()
+            logger.info(f"Verifying repository access: {test_url}")
+            import requests
+            response = requests.get(test_url, headers=headers)
+            if response.status_code != 200:
+                raise ValueError(f"Repository verification failed: {response.status_code} - {response.text}")
             
-            logger.info(f"Semgrep analysis completed successfully for {repo_name}")
-            return semgrep_process.stdout
+            # Clone with more detailed error output
+            clone_result = subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir],
+                capture_output=True,
+                text=True
+            )
             
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Semgrep output: {str(e)}")
-            analysis.status = 'failed'
-            analysis.error = f"Invalid Semgrep output: {str(e)}"
-            db.session.commit()
-            return None
+            if clone_result.returncode != 0:
+                error_msg = (
+                    f"Git clone failed with return code {clone_result.returncode}\n"
+                    f"STDERR: {clone_result.stderr}\n"
+                    f"STDOUT: {clone_result.stdout}"
+                )
+                logger.error(error_msg)
+                raise Exception(error_msg)
+                
+            logger.info(f"Repository cloned successfully: {repo_name}")
+            
+            # Run semgrep analysis
+            semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
+            logger.info(f"Running semgrep with command: {' '.join(semgrep_cmd)}")
+            
+            semgrep_process = subprocess.run(
+                semgrep_cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=clone_dir
+            )
+            
+            try:
+                semgrep_output = json.loads(semgrep_process.stdout)
+                analysis.status = 'completed'
+                analysis.results = semgrep_output
+                db.session.commit()
+                
+                logger.info(f"Semgrep analysis completed successfully for {repo_name}")
+                return semgrep_process.stdout
+                
+            except json.JSONDecodeError as e:
+                error_msg = f"Failed to parse Semgrep output: {str(e)}"
+                logger.error(error_msg)
+                analysis.status = 'failed'
+                analysis.error = error_msg
+                db.session.commit()
+                return None
+
+        except subprocess.CalledProcessError as e:
+            error_msg = (
+                f"Command '{' '.join(e.cmd)}' failed with return code {e.returncode}\n"
+                f"STDERR: {e.stderr}\n"
+                f"STDOUT: {e.stdout}"
+            )
+            logger.error(error_msg)
+            if 'analysis' in locals():
+                analysis.status = 'failed'
+                analysis.error = error_msg
+                db.session.commit()
+            raise Exception(error_msg)
 
     except Exception as e:
         logger.error(f"Analysis error for {repo_name}: {str(e)}")
@@ -255,6 +303,7 @@ def trigger_semgrep_analysis(repo_url, installation_token):
             analysis.error = str(e)
             db.session.commit()
         return None
+        
     finally:
         if clone_dir:
             clean_directory(clone_dir)
@@ -1295,7 +1344,65 @@ def get_latest_analyses():
                 'details': str(e)
             }
         }), 500
-    
+@app.route('/api/v1/analysis/test-access', methods=['POST'])
+def test_repository_access():
+    """Test repository access before attempting analysis"""
+    try:
+        payload = request.json
+        if not payload or 'owner' not in payload or 'repo' not in payload or 'installation_id' not in payload:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing required fields',
+                    'code': 'INVALID_PAYLOAD'
+                }
+            }), 400
+
+        owner = payload['owner']
+        repo = payload['repo']
+        installation_id = payload['installation_id']
+        
+        try:
+            # Get installation token
+            installation_token = git_integration.get_access_token(installation_id).token
+            
+            # Test repository access
+            test_url = f"https://api.github.com/repos/{owner}/{repo}"
+            headers = {
+                'Authorization': f'Bearer {installation_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            import requests
+            response = requests.get(test_url, headers=headers)
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'status_code': response.status_code,
+                    'repository': f"{owner}/{repo}",
+                    'accessible': response.status_code == 200,
+                    'details': response.json() if response.status_code == 200 else response.text
+                }
+            })
+            
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': str(e),
+                    'code': 'ACCESS_ERROR'
+                }
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': str(e),
+                'code': 'TEST_FAILED'
+            }
+        }), 500
 
 @app.route('/debug/test-webhook', methods=['POST'])
 def test_webhook():
