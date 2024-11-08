@@ -622,7 +622,6 @@ def handle_webhook():
 def scan_repository():
     """Scan a specific repository with user ID"""
     try:
-        # Explicitly get JSON data and add content type checking
         if not request.is_json:
             logger.error("Request Content-Type is not application/json")
             return jsonify({
@@ -637,7 +636,6 @@ def scan_repository():
         logger.info(f"Request Headers: {dict(request.headers)}")
         logger.info(f"Request Data: {request.get_data(as_text=True)}")
 
-        # Get JSON payload with error handling
         try:
             payload = request.get_json(force=True)
             logger.info(f"Parsed payload: {payload}")
@@ -664,7 +662,6 @@ def scan_repository():
                 }
             }), 400
 
-        # Check for missing fields
         missing_fields = [field for field in required_fields if field not in payload]
         if missing_fields:
             logger.error(f"Missing required fields: {missing_fields}")
@@ -676,7 +673,6 @@ def scan_repository():
                 }
             }), 400
 
-        # Extract and validate fields
         owner = str(payload['owner'])
         repo = str(payload['repo'])
         installation_id = str(payload['installation_id'])
@@ -703,6 +699,27 @@ def scan_repository():
             installation_token = git_integration.get_access_token(int(installation_id)).token
             logger.info("Successfully obtained installation token")
 
+            # Create a PyGithub instance to verify repository access
+            from github import Github
+            gh = Github(installation_token)
+            
+            try:
+                # Try to get the repository
+                github_repo = gh.get_repo(repo_name)
+                logger.info(f"Successfully verified access to repository: {repo_name}")
+                logger.info(f"Repository visibility: {github_repo.visibility}")
+                logger.info(f"Repository URL: {github_repo.html_url}")
+            except Exception as repo_error:
+                logger.error(f"Failed to access repository: {str(repo_error)}")
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Repository not found or not accessible',
+                        'details': 'Please verify the repository name and ensure the GitHub App has access to it',
+                        'error': str(repo_error)
+                    }
+                }), 404
+
             # Clone repository and run semgrep analysis
             clone_dir = None
             try:
@@ -723,19 +740,6 @@ def scan_repository():
                 # Clean and clone repository
                 clean_directory(clone_dir)
                 logger.info(f"Cloning repository to {clone_dir}")
-                
-                # First verify the repository exists and is accessible
-                test_url = f"https://api.github.com/repos/{repo_name}"
-                headers = {
-                    'Authorization': f'Bearer {installation_token}',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-                
-                logger.info(f"Verifying repository access: {test_url}")
-                import requests
-                response = requests.get(test_url, headers=headers)
-                if response.status_code != 200:
-                    raise ValueError(f"Repository verification failed: {response.status_code} - {response.text}")
                 
                 # Clone with more detailed error output
                 clone_result = subprocess.run(
@@ -799,25 +803,6 @@ def scan_repository():
                             'details': str(e)
                         }
                     }), 500
-
-            except subprocess.CalledProcessError as e:
-                error_msg = (
-                    f"Command '{' '.join(e.cmd)}' failed with return code {e.returncode}\n"
-                    f"STDERR: {e.stderr}\n"
-                    f"STDOUT: {e.stdout}"
-                )
-                logger.error(error_msg)
-                if 'analysis' in locals():
-                    analysis.status = 'failed'
-                    analysis.error = error_msg
-                    db.session.commit()
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Analysis command failed',
-                        'details': error_msg
-                    }
-                }), 500
 
             finally:
                 if clone_dir:
