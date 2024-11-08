@@ -132,7 +132,9 @@ def format_private_key(key_data):
         raise ValueError(f"Private key formatting failed: {str(e)}")
         
 def verify_webhook_signature(request_data, signature_header):
-    """Verify webhook signature with detailed logging"""
+    """
+    Enhanced webhook signature verification with detailed debugging
+    """
     try:
         # Get webhook secret
         webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
@@ -147,7 +149,7 @@ def verify_webhook_signature(request_data, signature_header):
             logger.error("No X-Hub-Signature-256 header received")
             return False
 
-        # Get the raw signature without 'sha256=' prefix
+        # Validate signature format
         if not signature_header.startswith('sha256='):
             logger.error("Signature header doesn't start with sha256=")
             return False
@@ -155,29 +157,34 @@ def verify_webhook_signature(request_data, signature_header):
         received_signature = signature_header.replace('sha256=', '')
         
         # Calculate expected signature
+        if isinstance(webhook_secret, str):
+            webhook_secret = webhook_secret.encode('utf-8')
+            
+        if isinstance(request_data, str):
+            request_data = request_data.encode('utf-8')
+            
         mac = hmac.new(
-            webhook_secret.encode('utf-8'),
+            webhook_secret,
             msg=request_data,
             digestmod=hashlib.sha256
         )
         expected_signature = mac.hexdigest()
         
-        # Log more details for debugging
-        logger.info(f"Request Content-Type: {request.headers.get('Content-Type')}")
-        logger.debug(f"Payload size: {len(request_data)} bytes")
-        logger.debug(f"Expected signature: {expected_signature}")
-        logger.debug(f"Received signature: {received_signature}")
+        # Enhanced debugging
+        logger.debug("Signature Verification Details:")
+        logger.debug(f"Received Signature  : {received_signature}")
+        logger.debug(f"Expected Signature  : {expected_signature}")
+        logger.debug(f"Request Data Length : {len(request_data)} bytes")
+        logger.debug(f"Secret Key Length   : {len(webhook_secret)} bytes")
         
-        # Compare signatures
+        # Compare signatures using hmac.compare_digest for timing attack prevention
         is_valid = hmac.compare_digest(expected_signature, received_signature)
         
         if not is_valid:
-            logger.error("Signature mismatch")
+            logger.error("Signature mismatch detected")
             logger.error(f"Header format: {signature_header}")
-            # Additional debugging info
-            logger.debug("Signature components:")
-            logger.debug(f"- Expected: {expected_signature[:10]}...")
-            logger.debug(f"- Received: {received_signature[:10]}...")
+            logger.error(f"Received signature: {received_signature[:10]}...")
+            logger.error(f"Expected signature: {expected_signature[:10]}...")
         else:
             logger.info("Webhook signature verified successfully")
             
@@ -187,6 +194,129 @@ def verify_webhook_signature(request_data, signature_header):
         logger.error(f"Signature verification failed: {str(e)}")
         logger.error(traceback.format_exc())
         return False
+
+@app.route('/webhook', methods=['POST'])
+def handle_webhook():
+    """Enhanced webhook handler with better error handling and logging"""
+    try:
+        logger.info("Received webhook request")
+        logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
+        logger.info(f"GitHub Event: {request.headers.get('X-GitHub-Event')}")
+        logger.info(f"GitHub Delivery: {request.headers.get('X-GitHub-Delivery')}")
+        
+        # Get raw data and signature
+        raw_data = request.get_data()
+        signature = request.headers.get('X-Hub-Signature-256')
+
+        # Debug logging for request
+        if os.getenv('FLASK_ENV') != 'production':
+            logger.debug("Raw Headers:")
+            for header, value in request.headers.items():
+                logger.debug(f"{header}: {value}")
+            logger.debug("Raw Payload:")
+            logger.debug(raw_data.decode('utf-8'))
+
+        if not signature:
+            logger.error("No X-Hub-Signature-256 header present")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing signature header',
+                    'code': 'MISSING_SIGNATURE'
+                }
+            }), 401
+            
+        # Verify signature
+        if not verify_webhook_signature(raw_data, signature):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Invalid signature',
+                    'code': 'INVALID_SIGNATURE',
+                    'details': 'Webhook signature verification failed'
+                }
+            }), 401
+
+        # Process the webhook event
+        event_type = request.headers.get('X-GitHub-Event', 'ping')
+        logger.info(f"Processing event type: {event_type}")
+
+        # Handle ping event
+        if event_type == 'ping':
+            return jsonify({
+                'success': True,
+                'message': 'Webhook configured successfully',
+                'event_type': 'ping'
+            })
+
+        # Add security advisory event handling
+        if event_type == 'security_advisory':
+            payload = request.json
+            if not payload:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Empty payload',
+                        'code': 'EMPTY_PAYLOAD'
+                    }
+                }), 400
+                
+            # Process security advisory
+            try:
+                advisory = payload.get('security_advisory', {})
+                logger.info(f"Processing security advisory: {advisory.get('ghsa_id')}")
+                # Add your security advisory handling logic here
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Security advisory processed',
+                    'advisory_id': advisory.get('ghsa_id')
+                })
+            except Exception as e:
+                logger.error(f"Error processing security advisory: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Failed to process security advisory',
+                        'details': str(e)
+                    }
+                }), 500
+
+        # Add debug endpoint for testing
+        if os.getenv('FLASK_ENV') != 'production':
+            @app.route('/debug/test-webhook', methods=['POST'])
+            def test_webhook():
+                try:
+                    webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+                    raw_data = request.get_data()
+                    received_signature = request.headers.get('X-Hub-Signature-256')
+                    
+                    return jsonify({
+                        'webhook_secret_configured': bool(webhook_secret),
+                        'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
+                        'received_signature': received_signature,
+                        'payload_size': len(raw_data),
+                        'headers': dict(request.headers)
+                    })
+                except Exception as e:
+                    return jsonify({'error': str(e)})
+
+        return jsonify({
+            'success': True,
+            'message': 'Event processed successfully',
+            'event_type': event_type
+        })
+
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Webhook processing failed',
+                'details': str(e)
+            }
+        }), 500
 
 
 
