@@ -1171,6 +1171,34 @@ def get_vulnerable_file():
                 'details': str(e)
             }
         }), 500
+@app.route('/debug/test-webhook', methods=['POST'])
+def test_webhook():
+    """Test endpoint to verify webhook signatures"""
+    if os.getenv('FLASK_ENV') != 'production':
+        try:
+            webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+            raw_data = request.get_data()
+            received_signature = request.headers.get('X-Hub-Signature-256')
+            
+            # Calculate signature
+            mac = hmac.new(
+                webhook_secret.encode('utf-8'),
+                msg=raw_data,
+                digestmod=hashlib.sha256
+            )
+            expected_signature = f"sha256={mac.hexdigest()}"
+            
+            return jsonify({
+                'webhook_secret_configured': bool(webhook_secret),
+                'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
+                'received_signature': received_signature,
+                'expected_signature': expected_signature,
+                'payload_size': len(raw_data),
+                'signatures_match': received_signature == expected_signature
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify({'message': 'Not available in production'}), 403
 
 if __name__ == '__main__':
     # Create database tables
