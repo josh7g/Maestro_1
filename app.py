@@ -15,6 +15,7 @@ from models import db, AnalysisResult
 from sqlalchemy import or_
 from sqlalchemy import text
 import traceback
+import requests
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -196,162 +197,110 @@ def verify_webhook_signature(request_data, signature_header):
         return False
 
 #Webhook handler
-@app.route('/webhook', methods=['POST'])
-def handle_webhook():
-    """Consolidated webhook handler for all GitHub events"""
+def verify_webhook_signature(request_data, signature_header):
+    """
+    Enhanced webhook signature verification for GitHub webhooks
+    """
     try:
-        logger.info("Received webhook request")
-        logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
-        logger.info(f"GitHub Event: {request.headers.get('X-GitHub-Event')}")
-        logger.info(f"GitHub Delivery: {request.headers.get('X-GitHub-Delivery')}")
+        webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
         
-        # Get raw data and signature
-        raw_data = request.get_data()
-        signature = request.headers.get('X-Hub-Signature-256')
+        logger.info("Starting webhook signature verification")
+        
+        if not webhook_secret:
+            logger.error("GITHUB_WEBHOOK_SECRET environment variable is not set")
+            return False
 
-        # Debug logging for request
-        if os.getenv('FLASK_ENV') != 'production':
-            logger.debug("Raw Headers:")
-            for header, value in request.headers.items():
-                logger.debug(f"{header}: {value}")
-            logger.debug("Raw Payload:")
-            logger.debug(raw_data.decode('utf-8'))
+        if not signature_header:
+            logger.error("No X-Hub-Signature-256 header received")
+            return False
 
-        if not signature:
-            logger.error("No X-Hub-Signature-256 header present")
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Missing signature header',
-                    'code': 'MISSING_SIGNATURE'
-                }
-            }), 401
+        if not signature_header.startswith('sha256='):
+            logger.error("Signature header doesn't start with sha256=")
+            return False
             
-        # Verify signature
-        if not verify_webhook_signature(raw_data, signature):
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Invalid signature',
-                    'code': 'INVALID_SIGNATURE',
-                    'details': 'Webhook signature verification failed'
-                }
-            }), 401
-
-        # Process the webhook event
-        event_type = request.headers.get('X-GitHub-Event', 'ping')
-        logger.info(f"Processing event type: {event_type}")
-
-        # Handle different event types
-        if event_type == 'ping':
-            return jsonify({
-                'success': True,
-                'message': 'Webhook configured successfully',
-                'event_type': 'ping'
-            })
-
-        elif event_type == 'security_advisory':
-            payload = request.json
-            if not payload:
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Empty payload',
-                        'code': 'EMPTY_PAYLOAD'
-                    }
-                }), 400
-                
-            advisory = payload.get('security_advisory', {})
-            logger.info(f"Processing security advisory: {advisory.get('ghsa_id')}")
+        # Get the raw signature without 'sha256=' prefix
+        received_signature = signature_header.replace('sha256=', '')
+        
+        # Ensure webhook_secret is bytes
+        if isinstance(webhook_secret, str):
+            webhook_secret = webhook_secret.strip().encode('utf-8')
             
-            return jsonify({
-                'success': True,
-                'message': 'Security advisory processed',
-                'advisory_id': advisory.get('ghsa_id')
-            })
-
-        elif event_type in ['installation', 'installation_repositories']:
-            payload = request.json
+        # Ensure request_data is bytes
+        if isinstance(request_data, str):
+            request_data = request_data.encode('utf-8')
             
-            # For installation_repositories, check for 'added' repositories
-            # For installation, check for 'created' or 'added' action
-            valid_actions = ['created', 'added']
-            if event_type == 'installation_repositories':
-                if not payload.get('repositories_added'):
-                    return jsonify({
-                        'success': True,
-                        'message': 'No repositories added'
-                    })
-            elif payload.get('action') not in valid_actions:
-                return jsonify({
-                    'success': True,
-                    'message': 'Event ignored'
-                })
-
-            installation_id = payload['installation']['id']
-            logger.info(f"Processing installation ID: {installation_id}")
-
-            try:
-                installation_token = git_integration.get_access_token(installation_id).token
-                
-                # Get repositories based on event type
-                repositories = (
-                    payload.get('repositories_added', []) 
-                    if event_type == 'installation_repositories'
-                    else payload.get('repositories', [])
-                )
-
-                processed_repos = []
-                for repo in repositories:
-                    repo_full_name = repo['full_name']
-                    repo_url = f"https://github.com/{repo_full_name}.git"
-                    
-                    logger.info(f"Analyzing repository: {repo_full_name}")
-                    user_id = payload.get('sender', {}).get('id')
-                    semgrep_output = trigger_semgrep_analysis(
-                        repo_url, 
-                        installation_token,
-                        user_id
-                    )
-                    
-                    if semgrep_output:
-                        processed_repos.append(repo_full_name)
-                        logger.info(f"Analysis completed for {repo_full_name}")
-
-                return jsonify({
-                    'success': True,
-                    'data': {
-                        'message': 'Analysis completed',
-                        'repositories_analyzed': processed_repos
-                    }
-                })
-
-            except Exception as e:
-                logger.error(f"Failed to process installation: {str(e)}")
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Failed to process installation',
-                        'details': str(e)
-                    }
-                }), 500
-
-        return jsonify({
-            'success': True,
-            'message': f'Event {event_type} received and processed'
-        })
+        # Calculate expected signature
+        mac = hmac.new(
+            webhook_secret,
+            msg=request_data,
+            digestmod=hashlib.sha256
+        )
+        expected_signature = mac.hexdigest()
+        
+        # Debug logging
+        logger.debug("Signature Details:")
+        logger.debug(f"Request Data Length: {len(request_data)} bytes")
+        logger.debug(f"Secret Key Length: {len(webhook_secret)} bytes")
+        logger.debug(f"Raw Request Data: {request_data[:100]}...")  # First 100 bytes
+        logger.debug(f"Received Header: {signature_header}")
+        logger.debug(f"Calculated HMAC: sha256={expected_signature}")
+        
+        # Use constant time comparison
+        is_valid = hmac.compare_digest(expected_signature, received_signature)
+        
+        if not is_valid:
+            logger.error("Signature mismatch detected")
+            logger.error(f"Header format: {signature_header}")
+            logger.error(f"Received signature: {received_signature[:10]}...")
+            logger.error(f"Expected signature: {expected_signature[:10]}...")
+            
+            # Additional debug info
+            if os.getenv('FLASK_ENV') != 'production':
+                logger.debug("Full signature comparison:")
+                logger.debug(f"Full received: {received_signature}")
+                logger.debug(f"Full expected: {expected_signature}")
+        else:
+            logger.info("Webhook signature verified successfully")
+            
+        return is_valid
 
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
+        logger.error(f"Signature verification failed: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Webhook processing failed',
-                'details': str(e)
-            }
-        }), 500
+        return False
 
+@app.route('/debug/test-webhook', methods=['POST'])
+def test_webhook():
+    """Test endpoint to verify webhook signatures"""
+    if os.getenv('FLASK_ENV') != 'production':
+        try:
+            webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+            raw_data = request.get_data()
+            received_signature = request.headers.get('X-Hub-Signature-256')
+            
+            # Test with the exact data received
+            result = verify_webhook_signature(raw_data, received_signature)
+            
+            # Calculate signature for debugging
+            mac = hmac.new(
+                webhook_secret.encode('utf-8') if isinstance(webhook_secret, str) else webhook_secret,
+                msg=raw_data,
+                digestmod=hashlib.sha256
+            )
+            expected_signature = f"sha256={mac.hexdigest()}"
+            
+            return jsonify({
+                'webhook_secret_configured': bool(webhook_secret),
+                'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
+                'received_signature': received_signature,
+                'expected_signature': expected_signature,
+                'payload_size': len(raw_data),
+                'signatures_match': result,
+                'raw_data_preview': raw_data.decode('utf-8')[:100] if raw_data else None
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify({'message': 'Not available in production'}), 403
 
 
 def clean_directory(directory):
@@ -395,7 +344,7 @@ def trigger_semgrep_analysis(repo_url, installation_token, user_id):
             }
             
             logger.info(f"Verifying repository access: {test_url}")
-            import requests
+            
             response = requests.get(test_url, headers=headers)
             if response.status_code != 200:
                 raise ValueError(f"Repository verification failed: {response.status_code} - {response.text}")
@@ -1470,34 +1419,6 @@ def test_repository_access():
             }
         }), 500
 
-@app.route('/debug/test-webhook', methods=['POST'])
-def test_webhook():
-    """Test endpoint to verify webhook signatures"""
-    if os.getenv('FLASK_ENV') != 'production':
-        try:
-            webhook_secret = os.getenv('GITHUB_WEBHOOK_SECRET')
-            raw_data = request.get_data()
-            received_signature = request.headers.get('X-Hub-Signature-256')
-            
-            # Calculate signature
-            mac = hmac.new(
-                webhook_secret.encode('utf-8'),
-                msg=raw_data,
-                digestmod=hashlib.sha256
-            )
-            expected_signature = f"sha256={mac.hexdigest()}"
-            
-            return jsonify({
-                'webhook_secret_configured': bool(webhook_secret),
-                'webhook_secret_length': len(webhook_secret) if webhook_secret else 0,
-                'received_signature': received_signature,
-                'expected_signature': expected_signature,
-                'payload_size': len(raw_data),
-                'signatures_match': received_signature == expected_signature
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)})
-    return jsonify({'message': 'Not available in production'}), 403
 
 if __name__ == '__main__':
     # Create database tables
