@@ -1216,28 +1216,21 @@ def get_filtered_vulnerabilities():
   
 @app.route('/api/v1/vulnerabilities/file', methods=['GET'])
 def get_vulnerable_file():
-    """
-    Get the contents of vulnerable files for a user with vulnerability details and version info
-    Query parameters:
-    - user_id: User ID (required)
-    - repository_name: Repository name (optional) - to filter specific repository
-    - file_path: File path (optional) - to filter specific file
-    """
     try:
         user_id = request.args.get('user_id')
+        installation_id = request.args.get('installation_id')
         repository_name = request.args.get('repository_name')
         file_path = request.args.get('file_path')
 
-        if not user_id:
+        if not user_id or not installation_id:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Missing user_id parameter',
-                    'code': 'MISSING_USER_ID'
+                    'message': 'Missing required parameters. Both user_id and installation_id are required.',
+                    'code': 'MISSING_PARAMETERS'
                 }
             }), 400
 
-        # First, let's check what data we have
         query = db.session.query(AnalysisResult).filter(
             AnalysisResult.status == 'completed',
             AnalysisResult.results.isnot(None),
@@ -1258,55 +1251,64 @@ def get_vulnerable_file():
                 }
             }), 404
 
-        # Log what we found for debugging
-        logger.info(f"Found {len(analyses)} analyses for user {user_id}")
-        for analysis in analyses:
-            logger.info(f"Analysis ID: {analysis.id}")
-            logger.info(f"Repository: {analysis.repository_name}")
-            logger.info(f"Results type: {type(analysis.results)}")
-            logger.info(f"Results preview: {str(analysis.results)[:200]}")
+        try:
+            installation_token = git_integration.get_access_token(int(installation_id)).token
+            gh = Github(installation_token)
+        except Exception as token_error:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Failed to authenticate with GitHub',
+                    'details': str(token_error)
+                }
+            }), 401
 
         vulnerable_files = []
 
         for analysis in analyses:
             try:
                 formatted_results = format_semgrep_results(analysis.results)
-                logger.info(f"Formatted results findings: {len(formatted_results.get('findings', []))}")
-
-                # Get the installation ID from the most recent scan
-                installation_id = None
-                recent_scans = db.session.query(AnalysisResult).filter(
-                    AnalysisResult.repository_name == analysis.repository_name,
-                    AnalysisResult.user_id == user_id
-                ).order_by(AnalysisResult.timestamp.desc()).limit(1).all()
-
-                if recent_scans:
-                    # Assuming you stored installation_id during the scan
-                    latest_scan = recent_scans[0]
-                    if hasattr(latest_scan, 'installation_id'):
-                        installation_id = latest_scan.installation_id
-                    else:
-                        # If no installation_id in analysis, try to get it from request args
-                        installation_id = request.args.get('installation_id')
-
-                if not installation_id:
-                    logger.error(f"No installation ID found for repository: {analysis.repository_name}")
-                    continue
-
-                # Get repository information
-                owner, repo = analysis.repository_name.split('/')
-                
-                # Get installation token
-                installation_token = git_integration.get_access_token(int(installation_id)).token
-                gh = Github(installation_token)
                 repository = gh.get_repo(analysis.repository_name)
                 
-                # Get repository details
+                # Get version information
+                version_info = {
+                    'tags': [],
+                    'latest_tag': None,
+                    'releases': [],
+                    'latest_release': None
+                }
+
+                # Get tags
+                try:
+                    tags = list(repository.get_tags())
+                    if tags:
+                        version_info['tags'] = [{
+                            'name': tag.name,
+                            'sha': tag.commit.sha,
+                            'date': tag.commit.commit.author.date.isoformat()
+                        } for tag in tags[:5]]  # Get latest 5 tags
+                        version_info['latest_tag'] = version_info['tags'][0]
+                except Exception as tag_error:
+                    logger.error(f"Error getting tags: {str(tag_error)}")
+
+                # Get releases
+                try:
+                    releases = list(repository.get_releases())
+                    if releases:
+                        version_info['releases'] = [{
+                            'name': release.title,
+                            'tag_name': release.tag_name,
+                            'date': release.created_at.isoformat(),
+                            'is_prerelease': release.prerelease
+                        } for release in releases[:5]]  # Get latest 5 releases
+                        version_info['latest_release'] = version_info['releases'][0]
+                except Exception as release_error:
+                    logger.error(f"Error getting releases: {str(release_error)}")
+
                 default_branch = repository.default_branch
                 latest_commit = repository.get_branch(default_branch).commit
                 commit_sha = latest_commit.sha
-                
-                # Process findings
+
                 for finding in formatted_results.get('findings', []):
                     current_file = finding.get('file')
                     
@@ -1314,7 +1316,6 @@ def get_vulnerable_file():
                         continue
 
                     try:
-                        # Get file content from GitHub
                         file_content = repository.get_contents(current_file, ref=commit_sha)
                         content = file_content.decoded_content.decode('utf-8')
                         lines = content.splitlines()
@@ -1327,6 +1328,7 @@ def get_vulnerable_file():
                                 'name': repository.name,
                                 'full_name': repository.full_name,
                                 'default_branch': default_branch,
+                                'version_info': version_info,  # Added version info here
                                 'current_commit': {
                                     'sha': commit_sha,
                                     'url': f"https://github.com/{repository.full_name}/commit/{commit_sha}",
@@ -1352,7 +1354,6 @@ def get_vulnerable_file():
                         }
                         
                         vulnerable_files.append(file_info)
-                        logger.info(f"Added vulnerable file: {current_file}")
                         
                     except Exception as file_error:
                         logger.error(f"Error processing file {current_file}: {str(file_error)}")
@@ -1360,7 +1361,6 @@ def get_vulnerable_file():
                     
             except Exception as analysis_error:
                 logger.error(f"Error processing analysis {analysis.id}: {str(analysis_error)}")
-                logger.error(traceback.format_exc())
                 continue
 
         return jsonify({
