@@ -1209,6 +1209,94 @@ def get_vulnerable_file():
                 'details': str(e)
             }
         }), 500
+    
+# Add these debug endpoints to verify the data
+
+@app.route('/api/v1/analysis/verify/<user_id>', methods=['GET'])
+def verify_user_analyses(user_id):
+    """Verify analyses for a specific user_id"""
+    try:
+        # Query all analyses for this user_id
+        analyses = AnalysisResult.query.filter_by(user_id=user_id).all()
+        
+        if not analyses:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'message': 'No analyses found for this user ID',
+                    'user_id': user_id,
+                    'count': 0
+                }
+            })
+        
+        # Format the results
+        results = []
+        for analysis in analyses:
+            results.append({
+                'id': analysis.id,
+                'repository_name': analysis.repository_name,
+                'user_id': analysis.user_id,
+                'timestamp': analysis.timestamp.isoformat(),
+                'status': analysis.status
+            })
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'user_id': user_id,
+                'count': len(results),
+                'analyses': results
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error verifying analyses: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Failed to verify analyses',
+                'details': str(e)
+            }
+        }), 500
+
+@app.route('/api/v1/analysis/latest', methods=['GET'])
+def get_latest_analyses():
+    """Get the most recent analyses with user IDs"""
+    try:
+        # Get the 10 most recent analyses
+        analyses = AnalysisResult.query.order_by(
+            AnalysisResult.timestamp.desc()
+        ).limit(10).all()
+        
+        results = []
+        for analysis in analyses:
+            results.append({
+                'id': analysis.id,
+                'repository_name': analysis.repository_name,
+                'user_id': analysis.user_id,
+                'timestamp': analysis.timestamp.isoformat(),
+                'status': analysis.status
+            })
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'count': len(results),
+                'analyses': results
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting latest analyses: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Failed to get latest analyses',
+                'details': str(e)
+            }
+        }), 500
+    
+
 @app.route('/debug/test-webhook', methods=['POST'])
 def test_webhook():
     """Test endpoint to verify webhook signatures"""
