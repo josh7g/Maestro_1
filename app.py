@@ -573,16 +573,37 @@ def handle_webhook():
 def scan_repository():
     """Scan a specific repository with user ID"""
     try:
+        # Log the incoming request
+        logger.info("Received scan request")
+        logger.debug(f"Request payload: {request.json}")
+
+        # Validate required fields
+        required_fields = ['owner', 'repo', 'installation_id', 'user_id']
         payload = request.json
-        if not payload or 'owner' not in payload or 'repo' not in payload or 'installation_id' not in payload or 'user_id' not in payload:
+        
+        if not payload:
+            logger.error("No JSON payload received")
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Missing required fields: owner, repo, installation_id, and user_id',
+                    'message': 'No payload provided',
+                    'code': 'MISSING_PAYLOAD'
+                }
+            }), 400
+
+        # Check for missing fields
+        missing_fields = [field for field in required_fields if field not in payload]
+        if missing_fields:
+            logger.error(f"Missing required fields: {missing_fields}")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': f'Missing required fields: {", ".join(missing_fields)}',
                     'code': 'INVALID_PAYLOAD'
                 }
             }), 400
 
+        # Extract fields
         owner = payload['owner']
         repo = payload['repo']
         installation_id = payload['installation_id']
@@ -590,8 +611,13 @@ def scan_repository():
         repo_name = f"{owner}/{repo}"
         repo_url = f"https://github.com/{repo_name}.git"
 
+        logger.info(f"Starting analysis for repository: {repo_name}")
+        logger.info(f"User ID: {user_id}")
+
         try:
+            # Get GitHub installation token
             installation_token = git_integration.get_access_token(installation_id).token
+            logger.info("Successfully obtained installation token")
         except Exception as e:
             logger.error(f"Failed to get installation token: {str(e)}")
             return jsonify({
@@ -602,30 +628,34 @@ def scan_repository():
                 }
             }), 404
 
-        # Update trigger_semgrep_analysis function to include user_id
-        def trigger_semgrep_analysis(repo_url, installation_token, user_id):
+        try:
+            # Clone repository and run semgrep analysis
             clone_dir = None
-            repo_name = repo_url.split('github.com/')[-1].replace('.git', '')
-            
             try:
-                repo_url_with_auth = f"https://x-access-token:{installation_token}@github.com/{repo_name}.git"
+                # Setup clone directory
                 clone_dir = f"/tmp/semgrep_{repo_name.replace('/', '_')}_{os.getpid()}"
-                
-                # Create initial database entry with user_id
+                repo_url_with_auth = f"https://x-access-token:{installation_token}@github.com/{repo_name}.git"
+
+                # Create database entry
                 analysis = AnalysisResult(
                     repository_name=repo_name,
-                    user_id=user_id,  # Store the user_id
+                    user_id=user_id,
                     status='in_progress'
                 )
                 db.session.add(analysis)
                 db.session.commit()
-                
+                logger.info(f"Created analysis record with ID: {analysis.id}")
+
+                # Clean and clone repository
                 clean_directory(clone_dir)
+                logger.info(f"Cloning repository to {clone_dir}")
                 
                 clone_cmd = ["git", "clone", "--depth", "1", repo_url_with_auth, clone_dir]
                 subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
                 logger.info(f"Repository cloned successfully: {repo_name}")
-                
+
+                # Run semgrep analysis
+                logger.info("Starting semgrep analysis")
                 semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
                 semgrep_process = subprocess.run(
                     semgrep_cmd,
@@ -634,68 +664,76 @@ def scan_repository():
                     check=True,
                     cwd=clone_dir
                 )
+
+                # Parse and store results
+                semgrep_output = json.loads(semgrep_process.stdout)
+                analysis.status = 'completed'
+                analysis.results = semgrep_output
+                db.session.commit()
                 
-                try:
-                    semgrep_output = json.loads(semgrep_process.stdout)
-                    
-                    # Update database entry with results
-                    analysis.status = 'completed'
-                    analysis.results = semgrep_output
-                    db.session.commit()
-                    
-                    logger.info(f"Semgrep analysis completed successfully for {repo_name}")
-                    return semgrep_process.stdout
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse Semgrep output: {str(e)}")
+                logger.info(f"Analysis completed successfully for {repo_name}")
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'message': 'Analysis completed successfully',
+                        'repository': repo_name,
+                        'user_id': user_id,
+                        'analysis_id': analysis.id,
+                        'status': 'completed'
+                    }
+                })
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Semgrep output: {str(e)}")
+                if 'analysis' in locals():
                     analysis.status = 'failed'
                     analysis.error = f"Invalid Semgrep output: {str(e)}"
                     db.session.commit()
-                    return None
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Failed to parse analysis results',
+                        'details': str(e)
+                    }
+                }), 500
 
             except Exception as e:
-                logger.error(f"Analysis error for {repo_name}: {str(e)}")
+                logger.error(f"Analysis error: {str(e)}")
                 if 'analysis' in locals():
                     analysis.status = 'failed'
                     analysis.error = str(e)
                     db.session.commit()
-                return None
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Analysis failed',
+                        'details': str(e)
+                    }
+                }), 500
+
             finally:
                 if clone_dir:
                     clean_directory(clone_dir)
 
-        # Call the updated function with user_id
-        semgrep_output = trigger_semgrep_analysis(repo_url, installation_token, user_id)
-        
-        if semgrep_output:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'message': 'Analysis initiated successfully',
-                    'repository': repo_name,
-                    'user_id': user_id,
-                    'status': 'completed'
-                }
-            })
-        else:
+        except Exception as e:
+            logger.error(f"Outer analysis error: {str(e)}")
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Analysis failed',
-                    'code': 'ANALYSIS_FAILED'
+                    'message': 'Analysis process failed',
+                    'details': str(e)
                 }
             }), 500
 
     except Exception as e:
-        logger.error(f"Scan error: {str(e)}")
+        logger.error(f"Scan endpoint error: {str(e)}")
         return jsonify({
             'success': False,
             'error': {
-                'message': 'Failed to initiate scan',
+                'message': 'Failed to process scan request',
                 'details': str(e)
             }
         }), 500
-
 @app.route('/api/v1/analysis/<owner>/<repo>/summary', methods=['GET'])
 def get_analysis_summary(owner, repo):
     """Get analysis summary"""
