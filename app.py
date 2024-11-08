@@ -953,7 +953,13 @@ def get_analysis_findings(owner, repo):
                 },
                 'metadata': {
                     'timestamp': result.timestamp.isoformat(),
-                    'status': result.status
+                    'status': result.status,
+                    'semgrep_version': formatted_results['summary']['semgrep_version']
+                },
+                'summary': {
+                    'files_scanned': formatted_results['summary']['total_files_scanned'],
+                    'scan_status': formatted_results['summary']['scan_status'],
+                    'total_findings': formatted_results['summary']['total_findings']
                 },
                 'findings': paginated_findings,
                 'pagination': {
@@ -977,7 +983,6 @@ def get_analysis_findings(owner, repo):
                 'details': str(e)
             }
         }), 500
-
 
 
 @app.route('/api/v1/users/top-vulnerabilities', methods=['GET'])
