@@ -980,76 +980,34 @@ def get_analysis_findings(owner, repo):
 
 
 
-# Keep the original GET endpoint for single user
-@app.route('/api/v1/users/<github_user>/top-vulnerabilities', methods=['GET'])
-def get_user_top_vulnerabilities(github_user):
-    """Get top vulnerabilities for a single GitHub user"""
-    return process_vulnerabilities([github_user])
-
-# Add new POST endpoint for multiple users
-@app.route('/api/v1/users/top-vulnerabilities', methods=['POST'])
-def get_multiple_users_vulnerabilities():
-    """Get top vulnerabilities for multiple GitHub users"""
+@app.route('/api/v1/users/top-vulnerabilities', methods=['GET'])
+def get_user_vulnerabilities():
+    """Get top vulnerabilities for a user by user_id"""
     try:
-        request_data = request.get_json()
-        if not request_data or 'users' not in request_data:
-            # If no users specified, get all repositories
-            return process_vulnerabilities([])
-            
-        users = request_data['users']
-        if not isinstance(users, list):
-            users = [users]
-        
-        # Clean and validate users
-        users = [user.strip() for user in users if isinstance(user, str) and user.strip()]
-        return process_vulnerabilities(users)
-        
-    except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {
-                'message': 'Failed to process request',
-                'details': str(e)
-            }
-        }), 500
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Missing user_id parameter',
+                    'code': 'MISSING_USER_ID'
+                }
+            }), 400
 
-def process_vulnerabilities(users=None, user_id=None):
-    """Process vulnerabilities for given users or all repositories if users is empty"""
-    try:
-        # Base query for completed analyses
-        base_query = db.session.query(AnalysisResult).filter(
+        logger.info(f"Fetching vulnerabilities for user_id: {user_id}")
+
+        # Query analyses for this user_id
+        analyses = db.session.query(AnalysisResult).filter(
             AnalysisResult.status == 'completed',
-            AnalysisResult.results.isnot(None)
-        )
-
-        # If users are specified, filter by those users
-        if users:
-            user_filters = [AnalysisResult.repository_name.like(f'{user}/%') for user in users]
-            base_query = base_query.filter(or_(*user_filters))
-
-        # Get all analyses ordered by timestamp
-        try:
-            analyses = base_query.order_by(AnalysisResult.timestamp.desc()).all()
-        except Exception as query_error:
-            if 'user_id' in str(query_error):
-                # If error is about user_id column, try alternative query
-                analyses = db.session.query(
-                    AnalysisResult.repository_name,
-                    AnalysisResult.timestamp,
-                    AnalysisResult.results
-                ).filter(
-                    AnalysisResult.status == 'completed',
-                    AnalysisResult.results.isnot(None)
-                ).order_by(AnalysisResult.timestamp.desc()).all()
-            else:
-                raise
+            AnalysisResult.results.isnot(None),
+            AnalysisResult.user_id == user_id
+        ).order_by(AnalysisResult.timestamp.desc()).all()
 
         if not analyses:
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'No analyses found',
+                    'message': 'No analyses found for this user',
                     'code': 'NO_ANALYSES_FOUND'
                 }
             }), 404
@@ -1079,7 +1037,10 @@ def process_vulnerabilities(users=None, user_id=None):
                             'description': finding.get('fix_recommendations', {}).get('description', ''),
                             'references': finding.get('fix_recommendations', {}).get('references', [])
                         },
-                        'line_range': finding.get('line_range'),
+                        'line_range': {
+                            'start': finding.get('line_start'),
+                            'end': finding.get('line_end')
+                        },
                         'message': finding.get('message'),
                         'repository': {
                             'analyzed_at': analysis.timestamp.isoformat(),
@@ -1087,8 +1048,8 @@ def process_vulnerabilities(users=None, user_id=None):
                             'name': repo_name.split('/')[-1]
                         },
                         'security_references': {
-                            'cwe': finding.get('security_references', {}).get('cwe', []),
-                            'owasp': finding.get('security_references', {}).get('owasp', [])
+                            'cwe': finding.get('cwe', []),
+                            'owasp': finding.get('owasp', [])
                         },
                         'severity': finding.get('severity'),
                         'vulnerability_id': finding.get('id')
@@ -1120,32 +1081,43 @@ def process_vulnerabilities(users=None, user_id=None):
 
         # Calculate statistics
         severity_counts = {}
+        category_counts = {}
+        repository_counts = {}
+
         for vuln in all_vulnerabilities:
+            # Count by severity
             severity = vuln['severity']
             severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            
+            # Count by category
+            category = vuln['category']
+            category_counts[category] = category_counts.get(category, 0) + 1
+            
+            # Count by repository
+            repo = vuln['repository']['full_name']
+            repository_counts[repo] = repository_counts.get(repo, 0) + 1
 
         unique_repos = {vuln['repository']['full_name'] for vuln in all_vulnerabilities}
         
-        response_data = {
+        return jsonify({
             'success': True,
             'data': {
                 'metadata': {
+                    'user_id': user_id,
                     'total_vulnerabilities': len(all_vulnerabilities),
                     'total_repositories': len(unique_repos),
                     'severity_breakdown': severity_counts,
+                    'category_breakdown': category_counts,
+                    'repository_breakdown': repository_counts,
+                    'last_scan': max(analysis.timestamp for analysis in analyses).isoformat() if analyses else None
                 },
-                'top_vulnerabilities': all_vulnerabilities
+                'vulnerabilities': all_vulnerabilities
             }
-        }
-
-        # Add user_id to response only if the column exists
-        if column_exists and user_id:
-            response_data['data']['user_id'] = user_id
-
-        return jsonify(response_data)
+        })
 
     except Exception as e:
         logger.error(f"Error processing vulnerabilities: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'success': False,
             'error': {
@@ -1153,37 +1125,95 @@ def process_vulnerabilities(users=None, user_id=None):
                 'details': str(e)
             }
         }), 500
-    
-@app.route('/api/v1/users/<github_user>/debug-findings', methods=['GET'])
-def debug_raw_findings(github_user):
-    """Debug endpoint to see raw findings data"""
+
+# Optional: Add endpoint for filtered vulnerabilities
+@app.route('/api/v1/users/vulnerabilities/filtered', methods=['GET'])
+def get_filtered_vulnerabilities():
+    """Get filtered vulnerabilities for a user"""
     try:
-        analysis = AnalysisResult.query.filter(
-            AnalysisResult.repository_name.like(f'{github_user}/%')
-        ).order_by(
-            AnalysisResult.timestamp.desc()
-        ).first()
-        
-        if not analysis:
+        user_id = request.args.get('user_id')
+        severity = request.args.get('severity')
+        category = request.args.get('category')
+        repository = request.args.get('repository')
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 20))
+
+        if not user_id:
             return jsonify({
                 'success': False,
-                'error': 'No analysis found'
-            })
-            
+                'error': {
+                    'message': 'Missing user_id parameter',
+                    'code': 'MISSING_USER_ID'
+                }
+            }), 400
+
+        # Base query
+        query = db.session.query(AnalysisResult).filter(
+            AnalysisResult.status == 'completed',
+            AnalysisResult.results.isnot(None),
+            AnalysisResult.user_id == user_id
+        )
+
+        if repository:
+            query = query.filter(AnalysisResult.repository_name == repository)
+
+        analyses = query.order_by(AnalysisResult.timestamp.desc()).all()
+
+        # Process vulnerabilities with filters
+        vulnerabilities = []
+        for analysis in analyses:
+            formatted_results = format_semgrep_results(analysis.results)
+            for finding in formatted_results.get('findings', []):
+                if severity and finding.get('severity') != severity:
+                    continue
+                if category and finding.get('category') != category:
+                    continue
+                
+                vulnerabilities.append({
+                    'severity': finding.get('severity'),
+                    'category': finding.get('category'),
+                    'message': finding.get('message'),
+                    'file': finding.get('file'),
+                    'code_snippet': finding.get('code_snippet'),
+                    'repository': analysis.repository_name,
+                    'timestamp': analysis.timestamp.isoformat()
+                })
+
+        # Pagination
+        total_items = len(vulnerabilities)
+        total_pages = (total_items + limit - 1) // limit
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        
         return jsonify({
             'success': True,
             'data': {
-                'repository': analysis.repository_name,
-                'timestamp': analysis.timestamp.isoformat(),
-                'raw_results': analysis.results
+                'vulnerabilities': vulnerabilities[start_idx:end_idx],
+                'pagination': {
+                    'page': page,
+                    'limit': limit,
+                    'total_items': total_items,
+                    'total_pages': total_pages
+                },
+                'filters': {
+                    'severity': severity,
+                    'category': category,
+                    'repository': repository
+                }
             }
         })
-        
+
     except Exception as e:
+        logger.error(f"Error getting filtered vulnerabilities: {str(e)}")
         return jsonify({
             'success': False,
-            'error': str(e)
-        })    
+            'error': {
+                'message': 'Failed to get filtered vulnerabilities',
+                'details': str(e)
+            }
+        }), 500
+    
+  
 @app.route('/api/v1/vulnerabilities/file', methods=['GET'])
 def get_vulnerable_file():
     """
