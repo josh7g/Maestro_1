@@ -1237,7 +1237,7 @@ def get_vulnerable_file():
                 }
             }), 400
 
-        # Query analyses for this user
+        # First, let's check what data we have
         query = db.session.query(AnalysisResult).filter(
             AnalysisResult.status == 'completed',
             AnalysisResult.results.isnot(None),
@@ -1258,146 +1258,110 @@ def get_vulnerable_file():
                 }
             }), 404
 
+        # Log what we found for debugging
+        logger.info(f"Found {len(analyses)} analyses for user {user_id}")
+        for analysis in analyses:
+            logger.info(f"Analysis ID: {analysis.id}")
+            logger.info(f"Repository: {analysis.repository_name}")
+            logger.info(f"Results type: {type(analysis.results)}")
+            logger.info(f"Results preview: {str(analysis.results)[:200]}")
+
         vulnerable_files = []
 
         for analysis in analyses:
             try:
+                formatted_results = format_semgrep_results(analysis.results)
+                logger.info(f"Formatted results findings: {len(formatted_results.get('findings', []))}")
+
+                # Get the installation ID from the most recent scan
+                installation_id = None
+                recent_scans = db.session.query(AnalysisResult).filter(
+                    AnalysisResult.repository_name == analysis.repository_name,
+                    AnalysisResult.user_id == user_id
+                ).order_by(AnalysisResult.timestamp.desc()).limit(1).all()
+
+                if recent_scans:
+                    # Assuming you stored installation_id during the scan
+                    latest_scan = recent_scans[0]
+                    if hasattr(latest_scan, 'installation_id'):
+                        installation_id = latest_scan.installation_id
+                    else:
+                        # If no installation_id in analysis, try to get it from request args
+                        installation_id = request.args.get('installation_id')
+
+                if not installation_id:
+                    logger.error(f"No installation ID found for repository: {analysis.repository_name}")
+                    continue
+
                 # Get repository information
                 owner, repo = analysis.repository_name.split('/')
                 
                 # Get installation token
-                installation_token = git_integration.get_access_token(int(analysis.installation_id)).token
+                installation_token = git_integration.get_access_token(int(installation_id)).token
                 gh = Github(installation_token)
                 repository = gh.get_repo(analysis.repository_name)
-                
-                # Get repository version information
-                version_info = {
-                    'latest_tag': None,
-                    'latest_release': None,
-                    'tags': [],
-                    'releases': []
-                }
-
-                # Get tags
-                try:
-                    tags = list(repository.get_tags())
-                    if tags:
-                        version_info['latest_tag'] = {
-                            'name': tags[0].name,
-                            'commit': tags[0].commit.sha,
-                            'date': tags[0].commit.commit.author.date.isoformat()
-                        }
-                        version_info['tags'] = [
-                            {
-                                'name': tag.name,
-                                'commit': tag.commit.sha,
-                                'date': tag.commit.commit.author.date.isoformat()
-                            }
-                            for tag in tags[:5]  # Get latest 5 tags
-                        ]
-                except Exception as tag_error:
-                    logger.error(f"Error getting tags: {str(tag_error)}")
-
-                # Get releases
-                try:
-                    releases = list(repository.get_releases())
-                    if releases:
-                        version_info['latest_release'] = {
-                            'name': releases[0].title,
-                            'tag_name': releases[0].tag_name,
-                            'date': releases[0].created_at.isoformat(),
-                            'is_prerelease': releases[0].prerelease
-                        }
-                        version_info['releases'] = [
-                            {
-                                'name': release.title,
-                                'tag_name': release.tag_name,
-                                'date': release.created_at.isoformat(),
-                                'is_prerelease': release.prerelease
-                            }
-                            for release in releases[:5]  # Get latest 5 releases
-                        ]
-                except Exception as release_error:
-                    logger.error(f"Error getting releases: {str(release_error)}")
                 
                 # Get repository details
                 default_branch = repository.default_branch
                 latest_commit = repository.get_branch(default_branch).commit
                 commit_sha = latest_commit.sha
                 
-                # Process semgrep results for this analysis
-                formatted_results = format_semgrep_results(analysis.results)
-                
-                # Group findings by file
-                files_dict = {}
-                
+                # Process findings
                 for finding in formatted_results.get('findings', []):
                     current_file = finding.get('file')
                     
                     if file_path and current_file != file_path:
                         continue
+
+                    try:
+                        # Get file content from GitHub
+                        file_content = repository.get_contents(current_file, ref=commit_sha)
+                        content = file_content.decoded_content.decode('utf-8')
+                        lines = content.splitlines()
                         
-                    if current_file not in files_dict:
-                        try:
-                            # Get file content from GitHub
-                            file_content = repository.get_contents(current_file, ref=commit_sha)
-                            content = file_content.decoded_content.decode('utf-8')
-                            lines = content.splitlines()
-                            
-                            files_dict[current_file] = {
-                                'path': current_file,
-                                'content': content,
-                                'total_lines': len(lines),
-                                'repository': {
-                                    'name': repository.name,
-                                    'full_name': repository.full_name,
-                                    'default_branch': default_branch,
-                                    'version_info': version_info,
-                                    'current_commit': {
-                                        'sha': commit_sha,
-                                        'url': f"https://github.com/{repository.full_name}/commit/{commit_sha}",
-                                        'timestamp': latest_commit.commit.author.date.isoformat()
-                                    }
+                        file_info = {
+                            'path': current_file,
+                            'content': content,
+                            'total_lines': len(lines),
+                            'repository': {
+                                'name': repository.name,
+                                'full_name': repository.full_name,
+                                'default_branch': default_branch,
+                                'current_commit': {
+                                    'sha': commit_sha,
+                                    'url': f"https://github.com/{repository.full_name}/commit/{commit_sha}",
+                                    'timestamp': latest_commit.commit.author.date.isoformat()
+                                }
+                            },
+                            'vulnerability': {
+                                'type': finding.get('id'),
+                                'severity': finding.get('severity'),
+                                'category': finding.get('category'),
+                                'message': finding.get('message'),
+                                'line_range': {
+                                    'start': finding.get('line_start'),
+                                    'end': finding.get('line_end')
                                 },
-                                'vulnerabilities': []
+                                'code_snippet': finding.get('code_snippet'),
+                                'fix_recommendations': finding.get('fix_recommendations', {}),
+                                'security_references': {
+                                    'cwe': finding.get('cwe', []),
+                                    'owasp': finding.get('owasp', [])
+                                }
                             }
-                        except Exception as file_error:
-                            logger.error(f"Error getting file content: {str(file_error)}")
-                            continue
-                    
-                    # Add vulnerability information
-                    vulnerability_info = {
-                        'type': finding.get('id'),
-                        'severity': finding.get('severity'),
-                        'category': finding.get('category'),
-                        'message': finding.get('message'),
-                        'line_range': {
-                            'start': finding.get('line_start'),
-                            'end': finding.get('line_end')
-                        },
-                        'code_snippet': finding.get('code_snippet'),
-                        'fix_recommendations': finding.get('fix_recommendations', {}),
-                        'security_references': {
-                            'cwe': finding.get('cwe', []),
-                            'owasp': finding.get('owasp', [])
                         }
-                    }
-                    
-                    files_dict[current_file]['vulnerabilities'].append(vulnerability_info)
-                
-                # Add files to result list
-                for file_info in files_dict.values():
-                    vulnerable_files.append(file_info)
+                        
+                        vulnerable_files.append(file_info)
+                        logger.info(f"Added vulnerable file: {current_file}")
+                        
+                    except Exception as file_error:
+                        logger.error(f"Error processing file {current_file}: {str(file_error)}")
+                        continue
                     
             except Exception as analysis_error:
                 logger.error(f"Error processing analysis {analysis.id}: {str(analysis_error)}")
+                logger.error(traceback.format_exc())
                 continue
-
-        # Sort files by number of vulnerabilities
-        vulnerable_files.sort(
-            key=lambda x: len(x['vulnerabilities']),
-            reverse=True
-        )
 
         return jsonify({
             'success': True,
@@ -1421,8 +1385,6 @@ def get_vulnerable_file():
                 'details': str(e)
             }
         }), 500
-    
-# Add these debug endpoints to verify the data
 
 @app.route('/api/v1/analysis/verify/<user_id>', methods=['GET'])
 def verify_user_analyses(user_id):
