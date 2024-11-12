@@ -1,4 +1,3 @@
-# scanner.py
 import os
 import subprocess
 import logging
@@ -135,17 +134,88 @@ class ChunkedScanner:
     def _is_scannable_file(self, file_path: Path) -> bool:
         """Check if file should be scanned"""
         SCANNABLE_EXTENSIONS = {
-            '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.go', '.rb',
-            '.php', '.cs', '.cpp', '.c', '.h', '.hpp', '.scala', '.kt',
-            '.rs', '.swift', '.m', '.mm', '.sql', '.sh', '.bash', '.zsh',
-            '.yml', '.yaml', '.json', '.xml', '.html', '.css', '.scss',
-            '.sass', '.less', '.vue', '.svelte', '.dart'
+            # Web development
+            '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
+            '.html', '.htm', '.css', '.scss', '.sass', '.less',
+            
+            # Backend development
+            '.py', '.rb', '.php', '.java', '.go', '.cs', '.cpp',
+            '.c', '.h', '.hpp', '.scala', '.kt', '.rs',
+            
+            # Mobile development
+            '.swift', '.m', '.mm', '.dart',
+            
+            # Configuration and data
+            '.json', '.yml', '.yaml', '.xml', '.conf', '.ini',
+            '.env', '.properties',
+            
+            # Scripts
+            '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd',
+            
+            # Template files
+            '.ejs', '.hbs', '.pug', '.jade', '.twig',
+            
+            # Documentation
+            '.md', '.markdown', '.rst', '.txt'
         }
 
-        return (
-            file_path.suffix.lower() in SCANNABLE_EXTENSIONS and
-            not any(exclude in file_path.parts for exclude in self.config.exclude_patterns)
-        )
+        # Check if file should be excluded based on path
+        if any(exclude in file_path.parts for exclude in self.config.exclude_patterns):
+            return False
+            
+        # Check file extension
+        is_scannable = file_path.suffix.lower() in SCANNABLE_EXTENSIONS
+        if is_scannable:
+            logger.debug(f"Including file for scanning: {file_path}")
+        return is_scannable
+
+    def _log_repository_contents(self, directory: Path):
+        """Log repository contents for debugging"""
+        logger.info("Repository contents:")
+        file_types = {}
+        excluded_files = []
+        included_files = []
+        
+        for dirpath, dirnames, filenames in os.walk(directory):
+            rel_path = Path(dirpath).relative_to(directory)
+            
+            # Check if directory should be excluded
+            if any(exclude in str(rel_path.parts) for exclude in self.config.exclude_patterns):
+                logger.info(f"Skipping excluded directory: {rel_path}")
+                continue
+                
+            for filename in filenames:
+                file_path = Path(dirpath) / filename
+                extension = file_path.suffix.lower()
+                
+                # Track file types
+                if extension not in file_types:
+                    file_types[extension] = 0
+                file_types[extension] += 1
+                
+                # Track included/excluded files
+                if self._is_scannable_file(file_path):
+                    included_files.append(str(file_path.relative_to(directory)))
+                else:
+                    excluded_files.append(str(file_path.relative_to(directory)))
+        
+        logger.info("File types found:")
+        for ext, count in file_types.items():
+            logger.info(f"  {ext}: {count} files")
+            
+        logger.info(f"\nTotal files to scan: {len(included_files)}")
+        logger.info("Files to be scanned:")
+        for file in included_files[:10]:  # Show first 10 files
+            logger.info(f"  {file}")
+        if len(included_files) > 10:
+            logger.info(f"  ... and {len(included_files) - 10} more")
+            
+        logger.info(f"\nTotal excluded files: {len(excluded_files)}")
+        logger.info("Excluded files (first 10):")
+        for file in excluded_files[:10]:
+            logger.info(f"  {file}")
+        if len(excluded_files) > 10:
+            logger.info(f"  ... and {len(excluded_files) - 10} more")
 
     def _chunk_directory(self, directory: Path) -> List[List[Path]]:
         """Split directory into manageable chunks"""
@@ -186,12 +256,7 @@ class ChunkedScanner:
         logger.info(f"Split repository into {len(all_files)} chunks")
         return all_files
 
-    async def _scan_chunk(
-        self, 
-        chunk: List[Path], 
-        chunk_index: int,
-        retries: int = 0
-    ) -> Optional[Dict]:
+    async def _scan_chunk(self, chunk: List[Path], chunk_index: int, retries: int = 0) -> Optional[Dict]:
         """Scan a chunk of files with Semgrep"""
         if retries >= self.config.max_retries:
             logger.error(f"Max retries reached for chunk {chunk_index}")
@@ -309,18 +374,25 @@ class ChunkedScanner:
 
         return merged
 
-    async def scan_repository(
-        self,
-        repo_url: str,
-        installation_token: str
-    ) -> Dict:
+    async def scan_repository(self, repo_url: str, installation_token: str) -> Dict:
         """Main method to scan a repository"""
         try:
             # Clone repository
             await self.clone_repository(repo_url, installation_token)
-
+            
+            # Log repository contents
+            self._log_repository_contents(self.repo_dir)
+            
             # Split into chunks
             chunks = self._chunk_directory(self.repo_dir)
+            
+            if not chunks:
+                logger.warning("No files to scan found in repository!")
+                return {
+                    'results': [],
+                    'errors': ['No scannable files found in repository'],
+                    'paths': {'scanned': [], 'ignored': []}
+                }
 
             # Scan chunks concurrently
             tasks = []
@@ -337,7 +409,6 @@ class ChunkedScanner:
         finally:
             self._cleanup_temp_dir()
 
-# Helper function for Flask route
 async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
     """Handler function for Flask route"""
     scanner = ChunkedScanner(ScanConfig(
