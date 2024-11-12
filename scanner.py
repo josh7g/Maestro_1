@@ -17,9 +17,12 @@ import git
 from github import Github, GithubIntegration
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%b %d %I:%M:%S %p'
+)
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class ScanConfig:
@@ -112,11 +115,12 @@ class ChunkedScanner:
         except Exception as e:
             logger.error(f"Error cleaning up directory {self.temp_dir}: {e}")
 
+
     async def clone_repository(self, repo_url: str, installation_token: str) -> Path:
         """Clone repository with progress monitoring and size checks"""
-        self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
         try:
+            self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
             auth_url = repo_url.replace(
                 'https://', 
                 f'https://x-access-token:{installation_token}@'
@@ -151,113 +155,136 @@ class ChunkedScanner:
     async def _get_directory_size(self, directory: Path) -> int:
         """Get directory size asynchronously"""
         total_size = 0
-        for dirpath, _, filenames in os.walk(directory):
-            if any(exclude in dirpath for exclude in self.config.exclude_patterns):
-                continue
-            for filename in filenames:
-                file_path = Path(dirpath) / filename
-                total_size += file_path.stat().st_size
+        try:
+            for dirpath, _, filenames in os.walk(directory):
+                if any(exclude in dirpath for exclude in self.config.exclude_patterns):
+                    continue
+                for filename in filenames:
+                    file_path = Path(dirpath) / filename
+                    total_size += file_path.stat().st_size
+        except Exception as e:
+            logger.error(f"Error calculating directory size: {e}")
+            raise
         return total_size
 
     def _is_scannable_file(self, file_path: Path) -> bool:
         """Check if file should be scanned based on extension and path"""
-        if any(exclude in file_path.parts for exclude in self.config.exclude_patterns):
+        try:
+            if any(exclude in file_path.parts for exclude in self.config.exclude_patterns):
+                return False
+                
+            is_scannable = file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS
+            if is_scannable:
+                logger.debug(f"Including file for scanning: {file_path}")
+            return is_scannable
+        except Exception as e:
+            logger.error(f"Error checking if file is scannable: {e}")
             return False
-            
-        is_scannable = file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS
-        if is_scannable:
-            logger.debug(f"Including file for scanning: {file_path}")
-        return is_scannable
 
     def _log_repository_contents(self, directory: Path):
         """Log repository contents for debugging"""
-        logger.info("Repository contents:")
-        file_types = {}
-        excluded_files = []
-        included_files = []
-        
-        for dirpath, dirnames, filenames in os.walk(directory):
-            rel_path = Path(dirpath).relative_to(directory)
+        try:
+            logger.info("Repository contents:")
+            file_types = {}
+            excluded_files = []
+            included_files = []
             
-            if any(exclude in str(rel_path.parts) for exclude in self.config.exclude_patterns):
-                logger.info(f"Skipping excluded directory: {rel_path}")
-                continue
+            for dirpath, dirnames, filenames in os.walk(directory):
+                rel_path = Path(dirpath).relative_to(directory)
                 
-            for filename in filenames:
-                file_path = Path(dirpath) / filename
-                extension = file_path.suffix.lower()
-                
-                if extension not in file_types:
-                    file_types[extension] = 0
-                file_types[extension] += 1
-                
-                if self._is_scannable_file(file_path):
-                    included_files.append(str(file_path.relative_to(directory)))
-                else:
-                    excluded_files.append(str(file_path.relative_to(directory)))
+                if any(exclude in str(rel_path.parts) for exclude in self.config.exclude_patterns):
+                    logger.debug(f"Skipping excluded directory: {rel_path}")
+                    continue
+                    
+                for filename in filenames:
+                    file_path = Path(dirpath) / filename
+                    extension = file_path.suffix.lower()
+                    
+                    if extension not in file_types:
+                        file_types[extension] = 0
+                    file_types[extension] += 1
+                    
+                    if self._is_scannable_file(file_path):
+                        included_files.append(str(file_path.relative_to(directory)))
+                    else:
+                        excluded_files.append(str(file_path.relative_to(directory)))
+            
+            self._log_file_statistics(file_types, included_files, excluded_files)
         
-        self._log_file_statistics(file_types, included_files, excluded_files)
+        except Exception as e:
+            logger.error(f"Error logging repository contents: {e}")
+            raise
 
     def _log_file_statistics(self, file_types: Dict[str, int], 
                            included_files: List[str], 
                            excluded_files: List[str]):
         """Log statistics about repository files"""
-        logger.info("\nFile types found:")
-        for ext, count in file_types.items():
-            logger.info(f"  {ext}: {count} files")
-            
-        logger.info(f"\nTotal files to scan: {len(included_files)}")
-        logger.info("Files to be scanned:")
-        for file in included_files[:10]:
-            logger.info(f"  {file}")
-        if len(included_files) > 10:
-            logger.info(f"  ... and {len(included_files) - 10} more")
-            
-        logger.info(f"\nTotal excluded files: {len(excluded_files)}")
-        logger.info("Excluded files (first 10):")
-        for file in excluded_files[:10]:
-            logger.info(f"  {file}")
-        if len(excluded_files) > 10:
-            logger.info(f"  ... and {len(excluded_files) - 10} more")
+        try:
+            logger.info("\nFile types found:")
+            for ext, count in file_types.items():
+                logger.info(f"  {ext}: {count} files")
+                
+            logger.info(f"\nTotal files to scan: {len(included_files)}")
+            logger.info("Files to be scanned:")
+            for file in included_files[:10]:
+                logger.info(f"  {file}")
+            if len(included_files) > 10:
+                logger.info(f"  ... and {len(included_files) - 10} more")
+                
+            logger.info(f"\nTotal excluded files: {len(excluded_files)}")
+            logger.info("Excluded files (first 10):")
+            for file in excluded_files[:10]:
+                logger.info(f"  {file}")
+            if len(excluded_files) > 10:
+                logger.info(f"  ... and {len(excluded_files) - 10} more")
+        
+        except Exception as e:
+            logger.error(f"Error logging file statistics: {e}")
 
     def _chunk_directory(self, directory: Path) -> List[List[Path]]:
         """Split directory into manageable chunks"""
-        all_files = []
-        current_chunk = []
-        current_chunk_size = 0
+        try:
+            all_files = []
+            current_chunk = []
+            current_chunk_size = 0
 
-        for dirpath, _, filenames in os.walk(directory):
-            if any(exclude in dirpath for exclude in self.config.exclude_patterns):
-                continue
-            
-            for filename in filenames:
-                file_path = Path(dirpath) / filename
-                if not self._is_scannable_file(file_path):
-                    continue
-
-                file_size = file_path.stat().st_size
-                if file_size > self.config.max_file_size_mb * 1024 * 1024:
-                    logger.warning(
-                        f"Skipping large file: {file_path} "
-                        f"({file_size / (1024**2):.2f} MB)"
-                    )
+            for dirpath, _, filenames in os.walk(directory):
+                if any(exclude in dirpath for exclude in self.config.exclude_patterns):
                     continue
                 
-                if current_chunk_size + file_size > self.config.chunk_size_mb * 1024 * 1024:
-                    if current_chunk:
-                        all_files.append(current_chunk)
-                    current_chunk = [file_path]
-                    current_chunk_size = file_size
-                else:
-                    current_chunk.append(file_path)
-                    current_chunk_size += file_size
+                for filename in filenames:
+                    file_path = Path(dirpath) / filename
+                    if not self._is_scannable_file(file_path):
+                        continue
 
-        if current_chunk:
-            all_files.append(current_chunk)
+                    file_size = file_path.stat().st_size
+                    if file_size > self.config.max_file_size_mb * 1024 * 1024:
+                        logger.warning(
+                            f"Skipping large file: {file_path} "
+                            f"({file_size / (1024**2):.2f} MB)"
+                        )
+                        continue
+                    
+                    if current_chunk_size + file_size > self.config.chunk_size_mb * 1024 * 1024:
+                        if current_chunk:
+                            all_files.append(current_chunk)
+                        current_chunk = [file_path]
+                        current_chunk_size = file_size
+                    else:
+                        current_chunk.append(file_path)
+                        current_chunk_size += file_size
 
-        logger.info(f"Split repository into {len(all_files)} chunks")
-        return all_files
+            if current_chunk:
+                all_files.append(current_chunk)
 
+            logger.info(f"Split repository into {len(all_files)} chunks")
+            return all_files
+
+        except Exception as e:
+            logger.error(f"Error chunking directory: {e}")
+            raise
+
+    
     async def _scan_chunk(self, chunk: List[Path], chunk_index: int, retries: int = 0) -> Optional[Dict]:
         """Scan a chunk of files with Semgrep"""
         if retries >= self.config.max_retries:
@@ -270,22 +297,28 @@ class ChunkedScanner:
         try:
             await self._setup_chunk_directory(chunk, chunk_dir)
             return await self._run_semgrep_scan(chunk, chunk_index, chunk_dir, retries)
+        except Exception as e:
+            logger.error(f"Error scanning chunk {chunk_index}: {e}")
+            return await self._handle_retry(chunk, chunk_index, retries)
         finally:
             if chunk_dir.exists():
                 shutil.rmtree(chunk_dir)
 
     async def _setup_chunk_directory(self, chunk: List[Path], chunk_dir: Path):
         """Set up directory structure for chunk scanning"""
-        for file_path in chunk:
-            try:
+        try:
+            for file_path in chunk:
                 relative_path = file_path.relative_to(self.repo_dir)
                 target_path = chunk_dir / relative_path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 
                 if not target_path.exists():
-                    os.symlink(file_path, target_path)
-            except ValueError as e:
-                logger.error(f"Path error for file {file_path}: {e}")
+                    shutil.copy2(file_path, target_path)
+                    os.chmod(target_path, 0o644)
+                    
+        except Exception as e:
+            logger.error(f"Error setting up chunk directory: {e}")
+            raise
 
     async def _run_semgrep_scan(self, chunk: List[Path], chunk_index: int, 
                                chunk_dir: Path, retries: int) -> Optional[Dict]:
@@ -293,9 +326,15 @@ class ChunkedScanner:
         cmd = [
             "semgrep",
             "--config=auto",
+            "--metrics=off",
+            "--skip-git",
             "--json",
             "--timeout",
             str(self.config.timeout_seconds),
+            "--max-memory",
+            f"{int(psutil.virtual_memory().total * self.config.max_memory_percent / 100 / (1024 * 1024))}M",
+            "--max-files",
+            str(len(chunk)),
             "."
         ]
 
@@ -324,20 +363,24 @@ class ChunkedScanner:
             )
 
         except asyncio.TimeoutError:
-            process.terminate()
+            if 'process' in locals():
+                process.terminate()
             logger.error(f"Timeout scanning chunk {chunk_index}")
+            return await self._handle_retry(chunk, chunk_index, retries)
+        except Exception as e:
+            logger.error(f"Error during Semgrep scan: {e}")
             return await self._handle_retry(chunk, chunk_index, retries)
 
     async def _process_semgrep_output(self, stdout: bytes, stderr: bytes,
                                     returncode: int, chunk_index: int,
                                     chunk: List[Path], retries: int) -> Optional[Dict]:
         """Process Semgrep output and handle errors"""
-        if returncode != 0:
-            error_msg = stderr.decode() if stderr else "No error message"
-            logger.error(f"Semgrep failed for chunk {chunk_index}: {error_msg}")
-            return await self._handle_retry(chunk, chunk_index, retries)
-
         try:
+            if returncode != 0:
+                error_msg = stderr.decode() if stderr else "No error message"
+                logger.error(f"Semgrep failed for chunk {chunk_index}: {error_msg}")
+                return await self._handle_retry(chunk, chunk_index, retries)
+
             result = json.loads(stdout.decode())
             logger.info(
                 f"Successfully scanned chunk {chunk_index} "
@@ -346,6 +389,9 @@ class ChunkedScanner:
             return result
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Semgrep output: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error processing Semgrep output: {e}")
             return None
 
     async def _handle_retry(self, chunk: List[Path], chunk_index: int,
@@ -358,30 +404,34 @@ class ChunkedScanner:
 
     def _merge_results(self, chunk_results: List[Optional[Dict]]) -> Dict:
         """Merge results from all chunks"""
-        merged = {
-            'results': [],
-            'errors': [],
-            'paths': {
-                'scanned': set(),
-                'ignored': set()
+        try:
+            merged = {
+                'results': [],
+                'errors': [],
+                'paths': {
+                    'scanned': set(),
+                    'ignored': set()
+                }
             }
-        }
 
-        for result in chunk_results:
-            if not result:
-                continue
+            for result in chunk_results:
+                if not result:
+                    continue
+                    
+                merged['results'].extend(result.get('results', []))
+                merged['errors'].extend(result.get('errors', []))
                 
-            merged['results'].extend(result.get('results', []))
-            merged['errors'].extend(result.get('errors', []))
-            
-            paths = result.get('paths', {})
-            merged['paths']['scanned'].update(paths.get('scanned', []))
-            merged['paths']['ignored'].update(paths.get('ignored', []))
+                paths = result.get('paths', {})
+                merged['paths']['scanned'].update(paths.get('scanned', []))
+                merged['paths']['ignored'].update(paths.get('ignored', []))
 
-        merged['paths']['scanned'] = list(merged['paths']['scanned'])
-        merged['paths']['ignored'] = list(merged['paths']['ignored'])
+            merged['paths']['scanned'] = list(merged['paths']['scanned'])
+            merged['paths']['ignored'] = list(merged['paths']['ignored'])
 
-        return merged
+            return merged
+        except Exception as e:
+            logger.error(f"Error merging results: {e}")
+            raise
 
     async def scan_repository(self, repo_url: str, installation_token: str) -> Dict:
         """Main method to scan a repository"""
@@ -398,7 +448,6 @@ class ChunkedScanner:
                     'paths': {'scanned': [], 'ignored': []}
                 }
 
-            
             logger.info(f"Starting concurrent scan of {len(chunks)} chunks")
             tasks = [asyncio.create_task(self._scan_chunk(chunk, i)) 
                     for i, chunk in enumerate(chunks)]
@@ -418,16 +467,7 @@ class ChunkedScanner:
 
 
 async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
-    """
-    Handler function for Flask route that manages repository scanning process.
-    
-    Args:
-        repo_url (str): URL of the repository to scan
-        installation_token (str): GitHub installation token for authentication
-        
-    Returns:
-        Dict: Result containing either success data or error information
-    """
+    """Handler function for Flask route that manages repository scanning process"""
     scanner = ChunkedScanner(ScanConfig(
         max_file_size_mb=50,
         max_total_size_gb=2,
