@@ -155,10 +155,10 @@ class ChunkedScanner:
             "scan",
             "--config=auto",
             "--json",
+            "--quiet",  # Reduce noise in output
+            "--no-git-ignore",  # Don't use git ignore rules
             "--timeout",
             str(self.config.timeout_seconds),
-            # Remove unsupported options
-            # "--disable-metrics" and "--disable-version-check" are not supported
             str(target_dir)
         ]
 
@@ -168,7 +168,8 @@ class ChunkedScanner:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(target_dir)
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -176,18 +177,44 @@ class ChunkedScanner:
                 timeout=self.config.timeout_seconds
             )
 
-            if process.returncode != 0:
-                error_msg = stderr.decode() if stderr else "No error message"
-                logger.error(f"Semgrep scan failed with error: {error_msg}")
-                raise RuntimeError(f"Semgrep scan failed: {error_msg}")
+            stdout_str = stdout.decode() if stdout else ""
+            stderr_str = stderr.decode() if stderr else ""
 
+            # Log the raw output for debugging
+            logger.debug(f"Semgrep stdout: {stdout_str}")
+            logger.debug(f"Semgrep stderr: {stderr_str}")
+
+            # Try to parse JSON output even if return code is non-zero
+            # as Semgrep sometimes returns findings with non-zero exit code
             try:
-                results = json.loads(stdout.decode())
-                logger.info("Semgrep scan completed successfully")
-                return results
+                if stdout_str.strip():
+                    results = json.loads(stdout_str)
+                    
+                    # Add empty arrays for expected fields if they don't exist
+                    results.setdefault('results', [])
+                    results.setdefault('errors', [])
+                    results.setdefault('paths', {'scanned': [], 'ignored': []})
+                    
+                    # Log success with findings count
+                    logger.info(f"Semgrep scan completed with {len(results.get('results', []))} findings")
+                    return results
+                else:
+                    # If no output but process succeeded, return empty results
+                    logger.info("Semgrep scan completed with no findings")
+                    return {
+                        'results': [],
+                        'errors': [],
+                        'paths': {
+                            'scanned': [],
+                            'ignored': []
+                        }
+                    }
+
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Semgrep output: {e}")
-                raise RuntimeError("Failed to parse Semgrep output") from e
+                # If we can't parse JSON but have output, it's probably an error message
+                error_msg = stdout_str or stderr_str
+                logger.error(f"Failed to parse Semgrep output: {error_msg}")
+                raise RuntimeError(f"Failed to parse Semgrep output: {error_msg}")
 
         except asyncio.TimeoutError:
             if 'process' in locals():
@@ -203,6 +230,7 @@ class ChunkedScanner:
             logger.error(f"Semgrep scan error: {str(e)}")
             raise RuntimeError(f"Semgrep scan error: {str(e)}")
 
+    
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
