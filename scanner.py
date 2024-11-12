@@ -256,94 +256,106 @@ class ChunkedScanner:
         logger.info(f"Split repository into {len(all_files)} chunks")
         return all_files
 
-    async def _scan_chunk(self, chunk: List[Path], chunk_index: int, retries: int = 0) -> Optional[Dict]:
-        """Scan a chunk of files with Semgrep"""
-        if retries >= self.config.max_retries:
-            logger.error(f"Max retries reached for chunk {chunk_index}")
-            return None
+    # In scanner.py, update the _scan_chunk method:
 
-        chunk_dir = self.temp_dir / f"chunk_{chunk_index}"
-        chunk_dir.mkdir(exist_ok=True)
+async def _scan_chunk(
+    self, 
+    chunk: List[Path], 
+    chunk_index: int,
+    retries: int = 0
+) -> Optional[Dict]:
+    """Scan a chunk of files with Semgrep"""
+    if retries >= self.config.max_retries:
+        logger.error(f"Max retries reached for chunk {chunk_index}")
+        return None
+
+    chunk_dir = self.temp_dir / f"chunk_{chunk_index}"
+    chunk_dir.mkdir(exist_ok=True)
+
+    try:
+        # Create symlinks to files in chunk directory
+        for file_path in chunk:
+            try:
+                # Get the relative path from the repo root
+                relative_path = file_path.relative_to(self.repo_dir)
+                target_path = chunk_dir / relative_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Create symlink only if target doesn't exist
+                if not target_path.exists():
+                    # Use relative path for symlink
+                    os.symlink(file_path, target_path)
+                    
+            except ValueError as e:
+                logger.error(f"Path error for file {file_path}: {e}")
+                continue
+
+        # Run Semgrep with basic configuration
+        cmd = [
+            "semgrep",
+            "--config=auto",
+            "--json",
+            "--timeout",
+            str(self.config.timeout_seconds),
+            "."
+        ]
+
+        logger.info(f"Running Semgrep on chunk {chunk_index} with {len(chunk)} files")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(chunk_dir)
+        )
 
         try:
-            # Create symlinks to files in chunk directory
-            for file_path in chunk:
-                try:
-                    # Get the relative path from the repo root
-                    relative_path = file_path.relative_to(self.repo_dir)
-                    target_path = chunk_dir / relative_path
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    # Create symlink only if target doesn't exist
-                    if not target_path.exists():
-                        # Use relative path for symlink
-                        os.symlink(file_path, target_path)
-                        
-                except ValueError as e:
-                    logger.error(f"Path error for file {file_path}: {e}")
-                    continue
-
-            # Set resource limits
-            memory_limit = psutil.virtual_memory().total * self.config.max_memory_percent / 100
-
-            # Run Semgrep with resource constraints
-            cmd = [
-                "semgrep",
-                "--config=auto",
-                "--json",
-                "--timeout",
-                str(self.config.timeout_seconds),
-                "--max-memory",
-                f"{int(memory_limit / (1024 * 1024))}M",  # Convert to MB
-                "."
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(chunk_dir)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.timeout_seconds
             )
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.config.timeout_seconds
+            if process.returncode != 0:
+                error_msg = stderr.decode() if stderr else "No error message"
+                logger.error(
+                    f"Semgrep failed for chunk {chunk_index}: {error_msg}"
                 )
-
-                if process.returncode != 0:
-                    logger.error(
-                        f"Semgrep failed for chunk {chunk_index}: "
-                        f"{stderr.decode()}"
-                    )
-                    if retries < self.config.max_retries:
-                        logger.info(f"Retrying chunk {chunk_index}")
-                        return await self._scan_chunk(
-                            chunk, 
-                            chunk_index, 
-                            retries + 1
-                        )
-                    return None
-
-                return json.loads(stdout)
-
-            except asyncio.TimeoutError:
-                process.terminate()
-                logger.error(f"Timeout scanning chunk {chunk_index}")
                 if retries < self.config.max_retries:
-                    return await self._scan_chunk(chunk, chunk_index, retries + 1)
+                    logger.info(f"Retrying chunk {chunk_index}")
+                    return await self._scan_chunk(
+                        chunk, 
+                        chunk_index, 
+                        retries + 1
+                    )
                 return None
 
-        except Exception as e:
-            logger.error(f"Error scanning chunk {chunk_index}: {e}")
+            try:
+                result = json.loads(stdout)
+                logger.info(
+                    f"Successfully scanned chunk {chunk_index} "
+                    f"with {len(result.get('results', []))} findings"
+                )
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Semgrep output: {e}")
+                return None
+
+        except asyncio.TimeoutError:
+            process.terminate()
+            logger.error(f"Timeout scanning chunk {chunk_index}")
             if retries < self.config.max_retries:
                 return await self._scan_chunk(chunk, chunk_index, retries + 1)
             return None
 
-        finally:
-            # Cleanup chunk directory
-            if chunk_dir.exists():
-                shutil.rmtree(chunk_dir)
+    except Exception as e:
+        logger.error(f"Error scanning chunk {chunk_index}: {e}")
+        if retries < self.config.max_retries:
+            return await self._scan_chunk(chunk, chunk_index, retries + 1)
+        return None
+
+    finally:
+        # Cleanup chunk directory
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir)
 
     def _merge_results(self, chunk_results: List[Optional[Dict]]) -> Dict:
         """Merge results from all chunks"""
