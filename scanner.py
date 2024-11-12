@@ -43,15 +43,6 @@ class ScanConfig:
         '.vscode'
     ])
 
-@dataclass
-class ScanResult:
-    """Structure for scan results"""
-    findings: List[Dict] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    scanned_files: Set[str] = field(default_factory=set)
-    ignored_files: Set[str] = field(default_factory=set)
-    scan_time: datetime = field(default_factory=datetime.now)
-
 class GitProgress(git.RemoteProgress):
     """Progress monitor for git operations"""
     def update(self, op_code, cur_count, max_count=None, message=''):
@@ -59,10 +50,10 @@ class GitProgress(git.RemoteProgress):
             logger.info(f"Git progress: {message}")
         elif max_count:
             progress = (cur_count / max_count) * 100
-            size_mb = cur_count / (1024 * 1024)
-            logger.info(f"Git progress: {progress:.1f}% ({size_mb:.2f} MB)")
+            logger.info(f"Git progress: {progress:.1f}%")
 
-class RepositoryScanner:
+# Maintaining the ChunkedScanner name for compatibility
+class ChunkedScanner:
     """Scanner class for processing repositories"""
 
     SCANNABLE_EXTENSIONS = {
@@ -89,7 +80,6 @@ class RepositoryScanner:
         self.config = config
         self.temp_dir = None
         self.repo_dir = None
-        self.scan_result = ScanResult()
 
     async def __aenter__(self):
         """Setup for async context manager"""
@@ -149,27 +139,13 @@ class RepositoryScanner:
     async def _get_directory_size(self, directory: Path) -> int:
         """Calculate directory size excluding ignored paths"""
         total_size = 0
-        try:
-            for dirpath, _, filenames in os.walk(directory):
-                if any(exclude in dirpath for exclude in self.config.exclude_patterns):
-                    continue
-                for filename in filenames:
-                    file_path = Path(dirpath) / filename
-                    total_size += file_path.stat().st_size
-        except Exception as e:
-            logger.error(f"Error calculating directory size: {e}")
-            raise
+        for dirpath, _, filenames in os.walk(directory):
+            if any(exclude in dirpath for exclude in self.config.exclude_patterns):
+                continue
+            for filename in filenames:
+                file_path = Path(dirpath) / filename
+                total_size += file_path.stat().st_size
         return total_size
-
-    def _is_scannable_file(self, file_path: Path) -> bool:
-        """Determine if file should be scanned"""
-        try:
-            if any(exclude in file_path.parts for exclude in self.config.exclude_patterns):
-                return False
-            return file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS
-        except Exception as e:
-            logger.error(f"Error checking file scannability: {e}")
-            return False
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute Semgrep scan with proper configuration"""
@@ -206,7 +182,8 @@ class RepositoryScanner:
             return json.loads(stdout.decode())
 
         except asyncio.TimeoutError:
-            process.terminate()
+            if process:  # type: ignore
+                process.terminate()
             raise RuntimeError("Semgrep scan timed out")
         except json.JSONDecodeError:
             raise RuntimeError("Failed to parse Semgrep output")
@@ -216,51 +193,19 @@ class RepositoryScanner:
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
         try:
-            # Clone and scan repository
             repo_path = await self.clone_repository(repo_url, token)
-            scan_results = await self._run_semgrep_scan(repo_path)
-
-            # Process results
-            findings = scan_results.get('results', [])
-            self.scan_result.findings = findings
-            
-            # Get scanned and ignored files
-            for file in Path(repo_path).rglob('*'):
-                if file.is_file():
-                    rel_path = str(file.relative_to(repo_path))
-                    if self._is_scannable_file(file):
-                        self.scan_result.scanned_files.add(rel_path)
-                    else:
-                        self.scan_result.ignored_files.add(rel_path)
-
-            return {
-                'success': True,
-                'data': {
-                    'findings': self.scan_result.findings,
-                    'errors': self.scan_result.errors,
-                    'paths': {
-                        'scanned': list(self.scan_result.scanned_files),
-                        'ignored': list(self.scan_result.ignored_files)
-                    }
-                },
-                'metadata': {
-                    'scan_time': self.scan_result.scan_time.isoformat(),
-                    'total_files_scanned': len(self.scan_result.scanned_files),
-                    'total_files_ignored': len(self.scan_result.ignored_files),
-                    'total_findings': len(self.scan_result.findings)
-                }
-            }
-
+            return await self._run_semgrep_scan(repo_path)
         except Exception as e:
-            logger.error(f"Scan failed: {str(e)}", exc_info=True)
+            logger.error(f"Scan failed: {str(e)}")
             return {
                 'success': False,
                 'error': {
                     'message': str(e),
-                    'type': type(e).__name__,
-                    'timestamp': datetime.now().isoformat()
+                    'type': type(e).__name__
                 }
             }
+        finally:
+            await self._cleanup()
 
 async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
     """Handler function for web routes"""
@@ -273,5 +218,19 @@ async def scan_repository_handler(repo_url: str, installation_token: str) -> Dic
         concurrent_processes=2
     )
     
-    async with RepositoryScanner(config) as scanner:
-        return await scanner.scan_repository(repo_url, installation_token)
+    async with ChunkedScanner(config) as scanner:
+        try:
+            results = await scanner.scan_repository(repo_url, installation_token)
+            return {
+                'success': True,
+                'data': results
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': {
+                    'message': str(e),
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat()
+                }
+            }
