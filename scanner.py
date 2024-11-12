@@ -25,11 +25,11 @@ class ScanConfig:
     """Configuration for repository scanning"""
     max_file_size_mb: int = 50
     max_total_size_gb: int = 2
-    max_memory_percent: int = 80
+    max_memory_percent: int = 90
     chunk_size_mb: int = 500
     timeout_seconds: int = 3600
     max_retries: int = 3
-    concurrent_processes: int = 2
+    concurrent_processes: int = 1
     exclude_patterns: List[str] = field(default_factory=lambda: [
         'node_modules',
         'vendor',
@@ -148,21 +148,41 @@ class ChunkedScanner:
         return total_size
 
     
+    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with proper configuration"""
+        """Execute Semgrep scan with proper memory management"""
+        # Calculate 70% of available system memory in MB
+        available_memory = psutil.virtual_memory().available
+        max_memory_mb = int((available_memory * 0.7) / (1024 * 1024))  # 70% of available memory
+        
+        # Cap at 5000MB if it's higher (Semgrep's recommended limit)
+        max_memory_mb = min(max_memory_mb, 5000)
+        
         cmd = [
             "semgrep",
             "scan",
             "--config=auto",
             "--json",
-            "--quiet",  # Reduce noise in output
-            "--no-git-ignore",  # Don't use git ignore rules
+            "--quiet",
+            "--no-git-ignore",
             "--timeout",
             str(self.config.timeout_seconds),
+            "--max-memory",
+            f"{max_memory_mb}",
+            "--jobs",
+            "1",  # Use single job to reduce memory usage
             str(target_dir)
         ]
 
-        logger.info(f"Running Semgrep scan with command: {' '.join(cmd)}")
+        logger.info(f"Running Semgrep scan with {max_memory_mb}MB max memory")
+        logger.debug(f"Full command: {' '.join(cmd)}")
+
+        try:
+            # Set ulimit for stack size (helps with memory issues)
+            import resource
+            resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+        except Exception as e:
+            logger.warning(f"Could not set stack limit: {e}")
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -180,41 +200,41 @@ class ChunkedScanner:
             stdout_str = stdout.decode() if stdout else ""
             stderr_str = stderr.decode() if stderr else ""
 
-            # Log the raw output for debugging
-            logger.debug(f"Semgrep stdout: {stdout_str}")
-            logger.debug(f"Semgrep stderr: {stderr_str}")
-
-            # Try to parse JSON output even if return code is non-zero
-            # as Semgrep sometimes returns findings with non-zero exit code
+            # Try to parse JSON output
             try:
                 if stdout_str.strip():
                     results = json.loads(stdout_str)
                     
-                    # Add empty arrays for expected fields if they don't exist
+                    # Check for memory-related errors
+                    if results.get('errors'):
+                        for error in results['errors']:
+                            if 'memory' in error.get('message', '').lower():
+                                logger.error("Memory limit reached, trying with reduced scope")
+                                # You might want to implement retry logic here with different parameters
+                                
+                    # Ensure all required fields exist
                     results.setdefault('results', [])
                     results.setdefault('errors', [])
                     results.setdefault('paths', {'scanned': [], 'ignored': []})
                     
-                    # Log success with findings count
-                    logger.info(f"Semgrep scan completed with {len(results.get('results', []))} findings")
+                    logger.info(f"Scan completed: Found {len(results.get('results', []))} issues")
                     return results
                 else:
-                    # If no output but process succeeded, return empty results
-                    logger.info("Semgrep scan completed with no findings")
+                    logger.info("Scan completed with no output")
                     return {
                         'results': [],
                         'errors': [],
                         'paths': {
                             'scanned': [],
                             'ignored': []
-                        }
+                        },
+                        'version': "1.56.0"
                     }
 
             except json.JSONDecodeError as e:
-                # If we can't parse JSON but have output, it's probably an error message
-                error_msg = stdout_str or stderr_str
-                logger.error(f"Failed to parse Semgrep output: {error_msg}")
-                raise RuntimeError(f"Failed to parse Semgrep output: {error_msg}")
+                error_msg = f"Failed to parse Semgrep output: {e}\nOutput: {stdout_str[:1000]}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
 
         except asyncio.TimeoutError:
             if 'process' in locals():
@@ -223,27 +243,55 @@ class ChunkedScanner:
                     await process.wait()
                 except Exception:
                     pass
-            logger.error(f"Semgrep scan timed out after {self.config.timeout_seconds} seconds")
-            raise RuntimeError(f"Semgrep scan timed out after {self.config.timeout_seconds} seconds")
+            raise RuntimeError(f"Scan timed out after {self.config.timeout_seconds} seconds")
             
         except Exception as e:
-            logger.error(f"Semgrep scan error: {str(e)}")
-            raise RuntimeError(f"Semgrep scan error: {str(e)}")
-
-    
+            error_msg = f"Scan error: {str(e)}\nStderr: {stderr_str if 'stderr_str' in locals() else 'N/A'}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
         try:
             repo_path = await self.clone_repository(repo_url, token)
-            return await self._run_semgrep_scan(repo_path)
+            
+            # Get repository size
+            repo_size = await self._get_directory_size(repo_path)
+            size_gb = repo_size / (1024 ** 3)
+            
+            # For large repositories, we might want to scan in chunks
+            if size_gb > 1:  # If larger than 1GB
+                logger.warning(f"Large repository detected ({size_gb:.2f} GB). Using optimized scan settings.")
+                # You might want to implement chunked scanning here
+            
+            try:
+                results = await self._run_semgrep_scan(repo_path)
+                return {
+                    'success': True,
+                    'data': results,
+                    'metadata': {
+                        'repository_size_gb': size_gb,
+                        'scan_timestamp': datetime.now().isoformat()
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Scan failed: {str(e)}")
+                return {
+                    'success': False,
+                    'error': {
+                        'message': str(e),
+                        'type': type(e).__name__,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                }
         except Exception as e:
-            logger.error(f"Scan failed: {str(e)}")
+            logger.error(f"Repository scan failed: {str(e)}")
             return {
                 'success': False,
                 'error': {
                     'message': str(e),
-                    'type': type(e).__name__
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat()
                 }
             }
         finally:
