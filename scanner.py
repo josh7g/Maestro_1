@@ -157,8 +157,13 @@ class ChunkedScanner:
             
         return chunks
 
+    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with chunking for large codebases"""
+        """Execute Semgrep scan with aggressive memory management"""
+        # Set a lower memory limit - 2GB max per process
+        max_memory_mb = 2000
+        
+        # Collect scannable files
         all_files = []
         for root, _, files in os.walk(target_dir):
             if any(exclude in root for exclude in self.config.exclude_patterns):
@@ -168,13 +173,11 @@ class ChunkedScanner:
                 if file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS:
                     all_files.append(file_path)
 
-        # Calculate available memory and chunk size
-        available_memory = psutil.virtual_memory().available
-        max_memory_mb = min(int((available_memory * 0.7) / (1024 * 1024)), 5000)
-        chunk_size_mb = min(max_memory_mb // 2, 500)  # Use half of max memory or 500MB, whichever is smaller
-
-        chunks = self._split_into_chunks(all_files, chunk_size_mb)
-        logger.info(f"Split scanning into {len(chunks)} chunks")
+        # Break into very small chunks (20 files per chunk)
+        chunk_size = 20
+        chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
+        
+        logger.info(f"Split scanning into {len(chunks)} chunks of {chunk_size} files each")
 
         all_results = {
             'results': [],
@@ -183,68 +186,123 @@ class ChunkedScanner:
             'version': "1.56.0"
         }
 
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Scanning chunk {i+1}/{len(chunks)} with {len(chunk)} files")
+        for i, chunk in enumerate(chunks, 1):
+            logger.info(f"Scanning chunk {i}/{len(chunks)} with {len(chunk)} files")
             
-            cmd = [
-                "semgrep",
-                "scan",
-                "--config=auto",
-                "--json",
-                "--timeout",
-                str(self.config.timeout_seconds),
-                "--max-memory",
-                f"{max_memory_mb}"
-            ]
-            cmd.extend(str(f) for f in chunk)
+            # Create temporary directory for this chunk
+            chunk_dir = target_dir / f"chunk_{i}"
+            chunk_dir.mkdir(exist_ok=True)
 
             try:
+                # Copy files to chunk directory
+                for file_path in chunk:
+                    rel_path = file_path.relative_to(target_dir)
+                    target_path = chunk_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, target_path)
+
+                cmd = [
+                    "semgrep",
+                    "scan",
+                    "--config=auto",
+                    "--json",
+                    "--max-memory",
+                    str(max_memory_mb),
+                    "--timeout",
+                    "300",  # 5 minutes per chunk
+                    "--jobs",
+                    "1",    # Single job
+                    "--verbose",
+                    str(chunk_dir)
+                ]
+
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=str(target_dir)
+                    cwd=str(chunk_dir)
                 )
 
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.config.timeout_seconds
-                )
-
-                stdout_str = stdout.decode() if stdout else ""
-                
-                if stdout_str.strip():
-                    chunk_results = json.loads(stdout_str)
-                    all_results['results'].extend(chunk_results.get('results', []))
-                    all_results['errors'].extend(chunk_results.get('errors', []))
-                    all_results['paths']['scanned'].extend(
-                        chunk_results.get('paths', {}).get('scanned', [])
-                    )
-                    all_results['paths']['ignored'].extend(
-                        chunk_results.get('paths', {}).get('ignored', [])
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=300  # 5 minutes timeout
                     )
 
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout scanning chunk {i+1}")
-                all_results['errors'].append({
-                    'code': 'timeout',
-                    'message': f'Scan timeout in chunk {i+1}'
-                })
-                continue
+                    stdout_str = stdout.decode() if stdout else ""
+                    stderr_str = stderr.decode() if stderr else ""
+
+                    # Log any stderr output for debugging
+                    if stderr_str:
+                        logger.debug(f"Stderr from chunk {i}: {stderr_str}")
+
+                    if stdout_str.strip():
+                        try:
+                            chunk_results = json.loads(stdout_str)
+                            # Merge results
+                            all_results['results'].extend(chunk_results.get('results', []))
+                            all_results['paths']['scanned'].extend(
+                                chunk_results.get('paths', {}).get('scanned', [])
+                            )
+                            all_results['paths']['ignored'].extend(
+                                chunk_results.get('paths', {}).get('ignored', [])
+                            )
+
+                            # Only add non-memory-related errors
+                            new_errors = [
+                                err for err in chunk_results.get('errors', [])
+                                if not any(memory_term in err.get('message', '').lower() 
+                                         for memory_term in ['memory', 'killed'])
+                            ]
+                            all_results['errors'].extend(new_errors)
+
+                            logger.info(f"Successfully scanned chunk {i} with "
+                                      f"{len(chunk_results.get('results', []))} findings")
+
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse JSON output from chunk {i}")
+                            continue
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout scanning chunk {i}")
+                    continue
+
             except Exception as e:
-                logger.error(f"Error scanning chunk {i+1}: {str(e)}")
-                all_results['errors'].append({
-                    'code': 'scan_error',
-                    'message': str(e)
-                })
+                logger.error(f"Error processing chunk {i}: {str(e)}")
                 continue
 
+            finally:
+                # Cleanup chunk directory
+                try:
+                    shutil.rmtree(chunk_dir)
+                except Exception as e:
+                    logger.error(f"Error cleaning up chunk directory: {str(e)}")
+
+        # Final validation of results
+        if not all_results['paths']['scanned'] and not all_results['errors']:
+            all_results['errors'].append({
+                'code': 1,
+                'level': 'warning',
+                'message': 'No files were successfully scanned',
+                'type': 'ScanError'
+            })
+
+        logger.info(f"Completed scan: {len(all_results['results'])} findings, "
+                   f"{len(all_results['paths']['scanned'])} files scanned")
+        
         return all_results
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
         try:
             repo_path = await self.clone_repository(repo_url, token)
+            
+            # Get repository size for logging
+            repo_size = await self._get_directory_size(repo_path)
+            size_mb = repo_size / (1024 * 1024)
+            
+            logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
+            
             results = await self._run_semgrep_scan(repo_path)
             
             return {
@@ -252,12 +310,14 @@ class ChunkedScanner:
                 'data': results,
                 'metadata': {
                     'repository_url': repo_url,
+                    'repository_size_mb': round(size_mb, 2),
                     'scan_timestamp': datetime.now().isoformat(),
                     'total_findings': len(results.get('results', [])),
                     'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
                     'total_errors': len(results.get('errors', []))
                 }
             }
+            
         except Exception as e:
             logger.error(f"Scan failed: {str(e)}")
             return {
@@ -268,6 +328,9 @@ class ChunkedScanner:
                     'timestamp': datetime.now().isoformat()
                 }
             }
+        finally:
+            await self._cleanup()
+
 
 class GitProgress(git.RemoteProgress):
     """Progress monitor for git operations"""
