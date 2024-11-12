@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import logging
@@ -43,6 +42,12 @@ class ScanConfig:
         '.idea',
         '.vscode'
     ])
+
+class GitProgress(git.RemoteProgress):
+    """Git progress handler for clone operations"""
+    def update(self, op_code, cur_count, max_count=None, message=''):
+        if message:
+            logger.info(f"Git progress: {message}")
 
 class ChunkedScanner:
     """Scanner class for processing repositories"""
@@ -135,31 +140,106 @@ class ChunkedScanner:
                 total_size += file_path.stat().st_size
         return total_size
 
-    def _split_into_chunks(self, files: List[Path], chunk_size_mb: int) -> List[List[Path]]:
-        """Split files into chunks based on size"""
-        chunks = []
-        current_chunk = []
-        current_size = 0
+    async def scan_repository(self, repo_url: str, token: str) -> Dict:
+        """
+        Main method to scan a repository
         
-        for file_path in files:
-            file_size = file_path.stat().st_size
-            if current_size + file_size > chunk_size_mb * 1024 * 1024:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = [file_path]
-                current_size = file_size
-            else:
-                current_chunk.append(file_path)
-                current_size += file_size
-                
-        if current_chunk:
-            chunks.append(current_chunk)
+        Args:
+            repo_url: URL of the repository to scan
+            token: Authentication token for access
             
-        return chunks
+        Returns:
+            Dict containing scan results, metadata, and status
+        """
+        scan_start_time = datetime.now()
+        
+        try:
+            # Clone repository
+            logger.info(f"Starting repository clone: {repo_url}")
+            repo_path = await self.clone_repository(repo_url, token)
+            
+            # Get repository size for logging
+            repo_size = await self._get_directory_size(repo_path)
+            size_mb = repo_size / (1024 * 1024)
+            logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
+            
+            # Get available rules
+            available_rules = [
+                "p/default",          # Default security rules
+                "p/security-audit",   # Comprehensive security audit
+                "p/owasp-top-ten",    # OWASP Top 10
+                "p/javascript",       # JavaScript-specific rules
+                "p/typescript",       # TypeScript-specific rules
+                "p/react",           # React-specific rules
+                "p/nodejs",          # Node.js rules
+                "p/secrets"          # Secret detection
+            ]
+            logger.info(f"Using security rules: {', '.join(available_rules)}")
+            
+            # Run the scan
+            results = await self._run_semgrep_scan(repo_path)
+            
+            # Calculate scan duration
+            scan_duration = (datetime.now() - scan_start_time).total_seconds()
+            
+            return {
+                'success': True,
+                'data': {
+                    'results': results.get('results', []),
+                    'errors': results.get('errors', []),
+                    'paths': {
+                        'scanned': results.get('paths', {}).get('scanned', []),
+                        'ignored': results.get('paths', {}).get('ignored', [])
+                    },
+                    'version': results.get('version', '1.56.0'),
+                    'security_summary': results.get('security_summary', {
+                        'high_severity': 0,
+                        'medium_severity': 0,
+                        'low_severity': 0,
+                        'categories': []
+                    }),
+                    'scan_status': 'completed',
+                    'files_scanned': len(results.get('paths', {}).get('scanned', [])),
+                    'total_findings': len(results.get('results', []))
+                },
+                'metadata': {
+                    'repository_url': repo_url,
+                    'repository_size_mb': round(size_mb, 2),
+                    'scan_start_time': scan_start_time.isoformat(),
+                    'scan_end_time': datetime.now().isoformat(),
+                    'scan_duration_seconds': round(scan_duration, 2),
+                    'rules_used': available_rules,
+                    'scanner_version': '1.56.0'
+                }
+            }
+            
+        except git.GitCommandError as e:
+            logger.error(f"Git operation failed: {str(e)}")
+            return {
+                'success': False,
+                'error': {
+                    'message': f"Repository clone failed: {str(e)}",
+                    'type': 'GitCommandError',
+                    'timestamp': datetime.now().isoformat()
+                }
+            }
+        except Exception as e:
+            logger.error(f"Scan failed: {str(e)}")
+            return {
+                'success': False,
+                'error': {
+                    'message': str(e),
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat(),
+                    'scan_duration_seconds': round((datetime.now() - scan_start_time).total_seconds(), 2)
+                }
+            }
+        finally:
+            try:
+                await self._cleanup()
+            except Exception as e:
+                logger.error(f"Cleanup failed: {str(e)}")
 
-    
-    
-    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute Semgrep scan with enhanced security rules"""
         max_memory_mb = 2000
@@ -331,10 +411,6 @@ class ChunkedScanner:
         )
         
         return all_results
-
-
-    
-    
 
 async def scan_repository_handler(repo_url: str, installation_token: str, user_id: str) -> Dict:
     """Handler function for web routes"""
