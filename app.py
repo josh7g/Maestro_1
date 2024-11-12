@@ -579,7 +579,7 @@ def root():
     
 @app.route('/api/v1/analysis/scan', methods=['POST'])
 async def scan_repository():
-    """Scan a specific repository with user ID"""
+    """Scan a specific repository with mandatory user ID"""
     try:
         if not request.is_json:
             return jsonify({
@@ -591,50 +591,121 @@ async def scan_repository():
             }), 400
 
         payload = request.get_json()
-        owner = str(payload['owner'])
-        repo = str(payload['repo'])
-        installation_id = str(payload['installation_id'])
-        user_id = str(payload['user_id'])
+        
+        # Required fields including user_id
+        required_fields = ['owner', 'repo', 'installation_id', 'user_id']
+        missing_fields = [field for field in required_fields if field not in payload]
+        
+        if missing_fields:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': f'Missing required fields: {", ".join(missing_fields)}',
+                    'code': 'MISSING_REQUIRED_FIELDS'
+                }
+            }), 400
+
+        # Validate field values
+        owner = str(payload['owner']).strip()
+        repo = str(payload['repo']).strip()
+        installation_id = str(payload['installation_id']).strip()
+        user_id = str(payload['user_id']).strip()
+
+        # Additional validation
+        if not all([owner, repo, installation_id, user_id]):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'All required fields must have non-empty values',
+                    'code': 'INVALID_FIELD_VALUES',
+                    'details': {
+                        'owner': bool(owner),
+                        'repo': bool(repo),
+                        'installation_id': bool(installation_id),
+                        'user_id': bool(user_id)
+                    }
+                }
+            }), 400
 
         repo_name = f"{owner}/{repo}"
         repo_url = f"https://github.com/{repo_name}.git"
 
-        # Get GitHub installation token
-        installation_token = git_integration.get_access_token(
-            int(installation_id)
-        ).token
+        try:
+            # Verify the installation token
+            installation_token = git_integration.get_access_token(
+                int(installation_id)
+            ).token
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Invalid installation ID or GitHub authentication failed',
+                    'code': 'GITHUB_AUTH_ERROR',
+                    'details': str(e)
+                }
+            }), 401
 
-        # Create initial database entry
-        analysis = AnalysisResult(
-            repository_name=repo_name,
-            user_id=user_id,
-            status='in_progress'
-        )
-        db.session.add(analysis)
-        db.session.commit()
+        # Create database entry
+        try:
+            analysis = AnalysisResult(
+                repository_name=repo_name,
+                user_id=user_id,
+                status='in_progress'
+            )
+            db.session.add(analysis)
+            db.session.commit()
+            logger.info(f"Created analysis record for user {user_id}, repository {repo_name}")
+        except Exception as e:
+            logger.error(f"Database error creating analysis record: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Failed to create analysis record',
+                    'code': 'DATABASE_ERROR',
+                    'details': str(e)
+                }
+            }), 500
 
-        # Run the enhanced scanner
-        scan_results = await scan_repository_handler(repo_url, installation_token)
+        # Run the scanner
+        try:
+            scan_results = await scan_repository_handler(repo_url, installation_token, user_id)
+            
+            # Update database with results
+            if scan_results['success']:
+                analysis.status = 'completed'
+                analysis.results = scan_results['data']
+            else:
+                analysis.status = 'failed'
+                analysis.error = scan_results['error']['message']
 
-        if scan_results['success']:
-            analysis.status = 'completed'
-            analysis.results = scan_results['data']
-        else:
+            db.session.commit()
+            logger.info(f"Updated analysis record {analysis.id} with status {analysis.status}")
+
+            return jsonify({
+                'success': scan_results['success'],
+                'data': {
+                    'message': 'Analysis completed' if scan_results['success'] else 'Analysis failed',
+                    'repository': repo_name,
+                    'user_id': user_id,
+                    'analysis_id': analysis.id,
+                    'status': analysis.status
+                }
+            })
+
+        except Exception as e:
             analysis.status = 'failed'
-            analysis.error = scan_results['error']['message']
-
-        db.session.commit()
-
-        return jsonify({
-            'success': scan_results['success'],
-            'data': {
-                'message': 'Analysis completed' if scan_results['success'] else 'Analysis failed',
-                'repository': repo_name,
-                'user_id': user_id,
-                'analysis_id': analysis.id,
-                'status': analysis.status
-            }
-        })
+            analysis.error = str(e)
+            db.session.commit()
+            
+            logger.error(f"Scan failed for {repo_name}: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Scan failed',
+                    'code': 'SCAN_ERROR',
+                    'details': str(e)
+                }
+            }), 500
 
     except Exception as e:
         logger.error(f"Scan endpoint error: {str(e)}")
@@ -642,7 +713,8 @@ async def scan_repository():
         return jsonify({
             'success': False,
             'error': {
-                'message': 'Failed to process scan request',
+                'message': 'Unexpected error processing scan request',
+                'code': 'UNEXPECTED_ERROR',
                 'details': str(e)
             }
         }), 500

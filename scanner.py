@@ -1,3 +1,4 @@
+
 import os
 import subprocess
 import logging
@@ -25,11 +26,11 @@ class ScanConfig:
     """Configuration for repository scanning"""
     max_file_size_mb: int = 50
     max_total_size_gb: int = 2
-    max_memory_percent: int = 90
+    max_memory_percent: int = 80
     chunk_size_mb: int = 500
     timeout_seconds: int = 3600
     max_retries: int = 3
-    concurrent_processes: int = 1
+    concurrent_processes: int = 1  # Set to 1 for better memory management
     exclude_patterns: List[str] = field(default_factory=lambda: [
         'node_modules',
         'vendor',
@@ -43,19 +44,8 @@ class ScanConfig:
         '.vscode'
     ])
 
-class GitProgress(git.RemoteProgress):
-    """Progress monitor for git operations"""
-    def update(self, op_code, cur_count, max_count=None, message=''):
-        if message:
-            logger.info(f"Git progress: {message}")
-        elif max_count:
-            progress = (cur_count / max_count) * 100
-            logger.info(f"Git progress: {progress:.1f}%")
-
-# Maintaining the ChunkedScanner name for compatibility
 class ChunkedScanner:
     """Scanner class for processing repositories"""
-
     SCANNABLE_EXTENSIONS = {
         # Web development
         '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
@@ -82,12 +72,10 @@ class ChunkedScanner:
         self.repo_dir = None
 
     async def __aenter__(self):
-        """Setup for async context manager"""
         await self._setup()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Cleanup for async context manager"""
         await self._cleanup()
 
     async def _setup(self):
@@ -147,145 +135,131 @@ class ChunkedScanner:
                 total_size += file_path.stat().st_size
         return total_size
 
-    
-    
-    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with proper memory management"""
-        # Calculate 70% of available system memory in MB
-        available_memory = psutil.virtual_memory().available
-        max_memory_mb = int((available_memory * 0.7) / (1024 * 1024))  # 70% of available memory
+    def _split_into_chunks(self, files: List[Path], chunk_size_mb: int) -> List[List[Path]]:
+        """Split files into chunks based on size"""
+        chunks = []
+        current_chunk = []
+        current_size = 0
         
-        # Cap at 5000MB if it's higher (Semgrep's recommended limit)
-        max_memory_mb = min(max_memory_mb, 5000)
-        
-        cmd = [
-            "semgrep",
-            "scan",
-            "--config=auto",
-            "--json",
-            "--quiet",
-            "--no-git-ignore",
-            "--timeout",
-            str(self.config.timeout_seconds),
-            "--max-memory",
-            f"{max_memory_mb}",
-            "--jobs",
-            "1",  # Use single job to reduce memory usage
-            str(target_dir)
-        ]
-
-        logger.info(f"Running Semgrep scan with {max_memory_mb}MB max memory")
-        logger.debug(f"Full command: {' '.join(cmd)}")
-
-        try:
-            # Set ulimit for stack size (helps with memory issues)
-            import resource
-            resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-        except Exception as e:
-            logger.warning(f"Could not set stack limit: {e}")
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(target_dir)
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self.config.timeout_seconds
-            )
-
-            stdout_str = stdout.decode() if stdout else ""
-            stderr_str = stderr.decode() if stderr else ""
-
-            # Try to parse JSON output
-            try:
-                if stdout_str.strip():
-                    results = json.loads(stdout_str)
-                    
-                    # Check for memory-related errors
-                    if results.get('errors'):
-                        for error in results['errors']:
-                            if 'memory' in error.get('message', '').lower():
-                                logger.error("Memory limit reached, trying with reduced scope")
-                                # You might want to implement retry logic here with different parameters
-                                
-                    # Ensure all required fields exist
-                    results.setdefault('results', [])
-                    results.setdefault('errors', [])
-                    results.setdefault('paths', {'scanned': [], 'ignored': []})
-                    
-                    logger.info(f"Scan completed: Found {len(results.get('results', []))} issues")
-                    return results
-                else:
-                    logger.info("Scan completed with no output")
-                    return {
-                        'results': [],
-                        'errors': [],
-                        'paths': {
-                            'scanned': [],
-                            'ignored': []
-                        },
-                        'version': "1.56.0"
-                    }
-
-            except json.JSONDecodeError as e:
-                error_msg = f"Failed to parse Semgrep output: {e}\nOutput: {stdout_str[:1000]}"
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
-
-        except asyncio.TimeoutError:
-            if 'process' in locals():
-                try:
-                    process.terminate()
-                    await process.wait()
-                except Exception:
-                    pass
-            raise RuntimeError(f"Scan timed out after {self.config.timeout_seconds} seconds")
+        for file_path in files:
+            file_size = file_path.stat().st_size
+            if current_size + file_size > chunk_size_mb * 1024 * 1024:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = [file_path]
+                current_size = file_size
+            else:
+                current_chunk.append(file_path)
+                current_size += file_size
+                
+        if current_chunk:
+            chunks.append(current_chunk)
             
-        except Exception as e:
-            error_msg = f"Scan error: {str(e)}\nStderr: {stderr_str if 'stderr_str' in locals() else 'N/A'}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+        return chunks
+
+    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+        """Execute Semgrep scan with chunking for large codebases"""
+        all_files = []
+        for root, _, files in os.walk(target_dir):
+            if any(exclude in root for exclude in self.config.exclude_patterns):
+                continue
+            for file in files:
+                file_path = Path(root) / file
+                if file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS:
+                    all_files.append(file_path)
+
+        # Calculate available memory and chunk size
+        available_memory = psutil.virtual_memory().available
+        max_memory_mb = min(int((available_memory * 0.7) / (1024 * 1024)), 5000)
+        chunk_size_mb = min(max_memory_mb // 2, 500)  # Use half of max memory or 500MB, whichever is smaller
+
+        chunks = self._split_into_chunks(all_files, chunk_size_mb)
+        logger.info(f"Split scanning into {len(chunks)} chunks")
+
+        all_results = {
+            'results': [],
+            'errors': [],
+            'paths': {'scanned': [], 'ignored': []},
+            'version': "1.56.0"
+        }
+
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Scanning chunk {i+1}/{len(chunks)} with {len(chunk)} files")
+            
+            cmd = [
+                "semgrep",
+                "scan",
+                "--config=auto",
+                "--json",
+                "--timeout",
+                str(self.config.timeout_seconds),
+                "--max-memory",
+                f"{max_memory_mb}"
+            ]
+            cmd.extend(str(f) for f in chunk)
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(target_dir)
+                )
+
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.timeout_seconds
+                )
+
+                stdout_str = stdout.decode() if stdout else ""
+                
+                if stdout_str.strip():
+                    chunk_results = json.loads(stdout_str)
+                    all_results['results'].extend(chunk_results.get('results', []))
+                    all_results['errors'].extend(chunk_results.get('errors', []))
+                    all_results['paths']['scanned'].extend(
+                        chunk_results.get('paths', {}).get('scanned', [])
+                    )
+                    all_results['paths']['ignored'].extend(
+                        chunk_results.get('paths', {}).get('ignored', [])
+                    )
+
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout scanning chunk {i+1}")
+                all_results['errors'].append({
+                    'code': 'timeout',
+                    'message': f'Scan timeout in chunk {i+1}'
+                })
+                continue
+            except Exception as e:
+                logger.error(f"Error scanning chunk {i+1}: {str(e)}")
+                all_results['errors'].append({
+                    'code': 'scan_error',
+                    'message': str(e)
+                })
+                continue
+
+        return all_results
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
         try:
             repo_path = await self.clone_repository(repo_url, token)
+            results = await self._run_semgrep_scan(repo_path)
             
-            # Get repository size
-            repo_size = await self._get_directory_size(repo_path)
-            size_gb = repo_size / (1024 ** 3)
-            
-            # For large repositories, we might want to scan in chunks
-            if size_gb > 1:  # If larger than 1GB
-                logger.warning(f"Large repository detected ({size_gb:.2f} GB). Using optimized scan settings.")
-                # You might want to implement chunked scanning here
-            
-            try:
-                results = await self._run_semgrep_scan(repo_path)
-                return {
-                    'success': True,
-                    'data': results,
-                    'metadata': {
-                        'repository_size_gb': size_gb,
-                        'scan_timestamp': datetime.now().isoformat()
-                    }
+            return {
+                'success': True,
+                'data': results,
+                'metadata': {
+                    'repository_url': repo_url,
+                    'scan_timestamp': datetime.now().isoformat(),
+                    'total_findings': len(results.get('results', [])),
+                    'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
+                    'total_errors': len(results.get('errors', []))
                 }
-            except Exception as e:
-                logger.error(f"Scan failed: {str(e)}")
-                return {
-                    'success': False,
-                    'error': {
-                        'message': str(e),
-                        'type': type(e).__name__,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                }
+            }
         except Exception as e:
-            logger.error(f"Repository scan failed: {str(e)}")
+            logger.error(f"Scan failed: {str(e)}")
             return {
                 'success': False,
                 'error': {
@@ -294,28 +268,49 @@ class ChunkedScanner:
                     'timestamp': datetime.now().isoformat()
                 }
             }
-        finally:
-            await self._cleanup()
 
-async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
+class GitProgress(git.RemoteProgress):
+    """Progress monitor for git operations"""
+    def update(self, op_code, cur_count, max_count=None, message=''):
+        if message:
+            logger.info(f"Git progress: {message}")
+        elif max_count:
+            progress = (cur_count / max_count) * 100
+            logger.info(f"Git progress: {progress:.1f}%")
+
+async def scan_repository_handler(repo_url: str, installation_token: str, user_id: str) -> Dict:
     """Handler function for web routes"""
+    if not all([repo_url, installation_token, user_id]):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Missing required parameters',
+                'code': 'INVALID_PARAMETERS',
+                'details': {
+                    'repo_url': bool(repo_url),
+                    'installation_token': bool(installation_token),
+                    'user_id': bool(user_id)
+                }
+            }
+        }
+
     config = ScanConfig(
         max_file_size_mb=50,
         max_total_size_gb=2,
-        max_memory_percent=80,
+        max_memory_percent=70,
         timeout_seconds=3600,
         max_retries=3,
-        concurrent_processes=2
+        concurrent_processes=1
     )
     
     async with ChunkedScanner(config) as scanner:
         try:
             results = await scanner.scan_repository(repo_url, installation_token)
-            return {
-                'success': True,
-                'data': results
-            }
+            if results['success']:
+                results['metadata']['user_id'] = user_id
+            return results
         except Exception as e:
+            logger.error(f"Scan failed: {str(e)}")
             return {
                 'success': False,
                 'error': {
