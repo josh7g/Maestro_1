@@ -16,6 +16,7 @@ import math
 import git
 from github import Github, GithubIntegration
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,42 @@ class ScanConfig:
     timeout_seconds: int = 3600
     max_retries: int = 3
     concurrent_processes: int = 2
+    exclude_patterns: List[str] = None
+
+    def __post_init__(self):
+        if self.exclude_patterns is None:
+            self.exclude_patterns = [
+                'node_modules',
+                'vendor',
+                'build',
+                'dist',
+                'target',
+                'venv',
+                'env',
+                '.git',
+                '.idea',
+                '.vscode'
+            ]
+
+class GitProgress(git.RemoteProgress):
+    """Progress monitor for git operations"""
+    def update(self, op_code, cur_count, max_count=None, message=''):
+        if message:
+            logger.info(f"Git progress: {message}")
+        else:
+            if max_count:
+                progress = (cur_count / max_count) * 100
+                size_mb = cur_count / (1024 * 1024)
+                rate = size_mb / (max_count if max_count > 0 else 1)
+                logger.info(f"Git progress: {size_mb:.2f} MiB | {rate:.2f} MiB/s")
 
 class ChunkedScanner:
     def __init__(self, config: ScanConfig = ScanConfig()):
+        """Initialize scanner with configuration"""
         self.config = config
         self.executor = ThreadPoolExecutor(max_workers=config.concurrent_processes)
+        self.repo_dir = None
+        self.temp_dir = None
         self._setup_temp_dir()
 
     def _setup_temp_dir(self):
@@ -44,14 +76,15 @@ class ChunkedScanner:
     def _cleanup_temp_dir(self):
         """Clean up temporary directory"""
         try:
-            shutil.rmtree(self.temp_dir)
-            logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+            if self.temp_dir and self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir)
+                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
         except Exception as e:
             logger.error(f"Error cleaning up directory {self.temp_dir}: {e}")
 
     async def clone_repository(self, repo_url: str, installation_token: str) -> Path:
         """Clone repository with progress monitoring and size checks"""
-        clone_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             # Add token to URL
@@ -60,40 +93,59 @@ class ChunkedScanner:
                 f'https://x-access-token:{installation_token}@'
             )
 
-            logger.info(f"Cloning repository to {clone_dir}")
+            logger.info(f"Cloning repository to {self.repo_dir}")
             
             # Use GitPython for better control
             repo = git.Repo.clone_from(
                 auth_url,
-                clone_dir,
+                self.repo_dir,
                 progress=GitProgress(),
                 multi_options=['--depth=1']  # Shallow clone
             )
 
             # Check repository size
-            repo_size = await self._get_directory_size(clone_dir)
+            repo_size = await self._get_directory_size(self.repo_dir)
+            size_mb = repo_size / (1024 * 1024)
+            logger.info(f"Successfully cloned repository: {size_mb:.2f} MB")
+            
             if repo_size > self.config.max_total_size_gb * 1024 * 1024 * 1024:
                 raise ValueError(
-                    f"Repository size ({repo_size / (1024**3):.2f} GB) exceeds "
+                    f"Repository size ({size_mb:.2f} MB) exceeds "
                     f"limit of {self.config.max_total_size_gb} GB"
                 )
 
-            logger.info(f"Successfully cloned repository: {repo_size / (1024**2):.2f} MB")
-            return clone_dir
+            return self.repo_dir
 
         except Exception as e:
-            if clone_dir.exists():
-                shutil.rmtree(clone_dir)
+            if self.repo_dir and self.repo_dir.exists():
+                shutil.rmtree(self.repo_dir)
             raise RuntimeError(f"Clone failed: {str(e)}") from e
 
     async def _get_directory_size(self, directory: Path) -> int:
         """Get directory size asynchronously"""
         total_size = 0
         for dirpath, _, filenames in os.walk(directory):
+            if any(exclude in dirpath for exclude in self.config.exclude_patterns):
+                continue
             for filename in filenames:
                 file_path = Path(dirpath) / filename
                 total_size += file_path.stat().st_size
         return total_size
+
+    def _is_scannable_file(self, file_path: Path) -> bool:
+        """Check if file should be scanned"""
+        SCANNABLE_EXTENSIONS = {
+            '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.go', '.rb',
+            '.php', '.cs', '.cpp', '.c', '.h', '.hpp', '.scala', '.kt',
+            '.rs', '.swift', '.m', '.mm', '.sql', '.sh', '.bash', '.zsh',
+            '.yml', '.yaml', '.json', '.xml', '.html', '.css', '.scss',
+            '.sass', '.less', '.vue', '.svelte', '.dart'
+        }
+
+        return (
+            file_path.suffix.lower() in SCANNABLE_EXTENSIONS and
+            not any(exclude in file_path.parts for exclude in self.config.exclude_patterns)
+        )
 
     def _chunk_directory(self, directory: Path) -> List[List[Path]]:
         """Split directory into manageable chunks"""
@@ -103,49 +155,36 @@ class ChunkedScanner:
 
         # Collect all scannable files
         for dirpath, _, filenames in os.walk(directory):
+            if any(exclude in dirpath for exclude in self.config.exclude_patterns):
+                continue
+            
             for filename in filenames:
                 file_path = Path(dirpath) / filename
-                if self._is_scannable_file(file_path):
-                    file_size = file_path.stat().st_size
-                    if file_size > self.config.max_file_size_mb * 1024 * 1024:
-                        logger.warning(
-                            f"Skipping large file: {file_path} "
-                            f"({file_size / (1024**2):.2f} MB)"
-                        )
-                        continue
-                    
-                    if current_chunk_size + file_size > self.config.chunk_size_mb * 1024 * 1024:
-                        if current_chunk:
-                            all_files.append(current_chunk)
-                        current_chunk = [file_path]
-                        current_chunk_size = file_size
-                    else:
-                        current_chunk.append(file_path)
-                        current_chunk_size += file_size
+                if not self._is_scannable_file(file_path):
+                    continue
+
+                file_size = file_path.stat().st_size
+                if file_size > self.config.max_file_size_mb * 1024 * 1024:
+                    logger.warning(
+                        f"Skipping large file: {file_path} "
+                        f"({file_size / (1024**2):.2f} MB)"
+                    )
+                    continue
+                
+                if current_chunk_size + file_size > self.config.chunk_size_mb * 1024 * 1024:
+                    if current_chunk:
+                        all_files.append(current_chunk)
+                    current_chunk = [file_path]
+                    current_chunk_size = file_size
+                else:
+                    current_chunk.append(file_path)
+                    current_chunk_size += file_size
 
         if current_chunk:
             all_files.append(current_chunk)
 
         logger.info(f"Split repository into {len(all_files)} chunks")
         return all_files
-
-    def _is_scannable_file(self, file_path: Path) -> bool:
-        """Check if file should be scanned"""
-        SCANNABLE_EXTENSIONS = {
-            '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.go', '.rb',
-            '.php', '.cs', '.cpp', '.c', '.h', '.hpp', '.scala', '.kt',
-            '.rs', '.swift', '.m', '.mm', '.sql', '.sh', '.bash', '.zsh'
-        }
-        
-        EXCLUDED_DIRS = {
-            'node_modules', 'vendor', 'build', 'dist', 'target',
-            'venv', 'env', '.git', '.idea', '.vscode'
-        }
-
-        return (
-            file_path.suffix in SCANNABLE_EXTENSIONS and
-            not any(part in EXCLUDED_DIRS for part in file_path.parts)
-        )
 
     async def _scan_chunk(
         self, 
@@ -164,11 +203,20 @@ class ChunkedScanner:
         try:
             # Create symlinks to files in chunk directory
             for file_path in chunk:
-                relative_path = file_path.relative_to(self.temp_dir / "repo")
-                target_path = chunk_dir / relative_path
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                if not target_path.exists():
-                    os.symlink(file_path, target_path)
+                try:
+                    # Get the relative path from the repo root
+                    relative_path = file_path.relative_to(self.repo_dir)
+                    target_path = chunk_dir / relative_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Create symlink only if target doesn't exist
+                    if not target_path.exists():
+                        # Use relative path for symlink
+                        os.symlink(file_path, target_path)
+                        
+                except ValueError as e:
+                    logger.error(f"Path error for file {file_path}: {e}")
+                    continue
 
             # Set resource limits
             memory_limit = psutil.virtual_memory().total * self.config.max_memory_percent / 100
@@ -180,6 +228,8 @@ class ChunkedScanner:
                 "--json",
                 "--timeout",
                 str(self.config.timeout_seconds),
+                "--max-memory",
+                f"{int(memory_limit / (1024 * 1024))}M",  # Convert to MB
                 "."
             ]
 
@@ -187,8 +237,7 @@ class ChunkedScanner:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(chunk_dir),
-                limit=memory_limit
+                cwd=str(chunk_dir)
             )
 
             try:
@@ -231,6 +280,35 @@ class ChunkedScanner:
             if chunk_dir.exists():
                 shutil.rmtree(chunk_dir)
 
+    def _merge_results(self, chunk_results: List[Optional[Dict]]) -> Dict:
+        """Merge results from all chunks"""
+        merged = {
+            'results': [],
+            'errors': [],
+            'paths': {
+                'scanned': set(),
+                'ignored': set()
+            }
+        }
+
+        for result in chunk_results:
+            if not result:
+                continue
+                
+            merged['results'].extend(result.get('results', []))
+            merged['errors'].extend(result.get('errors', []))
+            
+            # Update scanned and ignored paths
+            paths = result.get('paths', {})
+            merged['paths']['scanned'].update(paths.get('scanned', []))
+            merged['paths']['ignored'].update(paths.get('ignored', []))
+
+        # Convert sets to lists for JSON serialization
+        merged['paths']['scanned'] = list(merged['paths']['scanned'])
+        merged['paths']['ignored'] = list(merged['paths']['ignored'])
+
+        return merged
+
     async def scan_repository(
         self,
         repo_url: str,
@@ -239,10 +317,10 @@ class ChunkedScanner:
         """Main method to scan a repository"""
         try:
             # Clone repository
-            repo_dir = await self.clone_repository(repo_url, installation_token)
+            await self.clone_repository(repo_url, installation_token)
 
             # Split into chunks
-            chunks = self._chunk_directory(repo_dir)
+            chunks = self._chunk_directory(self.repo_dir)
 
             # Scan chunks concurrently
             tasks = []
@@ -254,43 +332,12 @@ class ChunkedScanner:
             chunk_results = await asyncio.gather(*tasks)
 
             # Merge results
-            merged_results = self._merge_results(chunk_results)
-
-            return merged_results
+            return self._merge_results(chunk_results)
 
         finally:
             self._cleanup_temp_dir()
 
-    def _merge_results(self, chunk_results: List[Optional[Dict]]) -> Dict:
-        """Merge results from all chunks"""
-        merged = {
-            'results': [],
-            'errors': [],
-            'paths': {'scanned': set(), 'ignored': set()}
-        }
-
-        for result in chunk_results:
-            if result is None:
-                continue
-
-            merged['results'].extend(result.get('results', []))
-            merged['errors'].extend(result.get('errors', []))
-            merged['paths']['scanned'].update(result.get('paths', {}).get('scanned', []))
-            merged['paths']['ignored'].update(result.get('paths', {}).get('ignored', []))
-
-        # Convert sets back to lists for JSON serialization
-        merged['paths']['scanned'] = list(merged['paths']['scanned'])
-        merged['paths']['ignored'] = list(merged['paths']['ignored'])
-
-        return merged
-
-class GitProgress(git.RemoteProgress):
-    """Progress monitor for git operations"""
-    def update(self, op_code, cur_count, max_count=None, message=''):
-        if message:
-            logger.info(f"Git progress: {message}")
-
-# Example usage in your Flask route
+# Helper function for Flask route
 async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
     """Handler function for Flask route"""
     scanner = ChunkedScanner(ScanConfig(
