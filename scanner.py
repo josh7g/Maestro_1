@@ -147,6 +147,7 @@ class ChunkedScanner:
                 total_size += file_path.stat().st_size
         return total_size
 
+    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute Semgrep scan with proper configuration"""
         cmd = [
@@ -156,12 +157,12 @@ class ChunkedScanner:
             "--json",
             "--timeout",
             str(self.config.timeout_seconds),
-            "--max-memory",
-            f"{int(psutil.virtual_memory().total * self.config.max_memory_percent / 100 / (1024 * 1024))}M",
-            "--disable-metrics",
-            "--disable-version-check",
+            # Remove unsupported options
+            # "--disable-metrics" and "--disable-version-check" are not supported
             str(target_dir)
         ]
+
+        logger.info(f"Running Semgrep scan with command: {' '.join(cmd)}")
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -177,18 +178,31 @@ class ChunkedScanner:
 
             if process.returncode != 0:
                 error_msg = stderr.decode() if stderr else "No error message"
+                logger.error(f"Semgrep scan failed with error: {error_msg}")
                 raise RuntimeError(f"Semgrep scan failed: {error_msg}")
 
-            return json.loads(stdout.decode())
+            try:
+                results = json.loads(stdout.decode())
+                logger.info("Semgrep scan completed successfully")
+                return results
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Semgrep output: {e}")
+                raise RuntimeError("Failed to parse Semgrep output") from e
 
         except asyncio.TimeoutError:
-            if process:  # type: ignore
-                process.terminate()
-            raise RuntimeError("Semgrep scan timed out")
-        except json.JSONDecodeError:
-            raise RuntimeError("Failed to parse Semgrep output")
+            if 'process' in locals():
+                try:
+                    process.terminate()
+                    await process.wait()
+                except Exception:
+                    pass
+            logger.error(f"Semgrep scan timed out after {self.config.timeout_seconds} seconds")
+            raise RuntimeError(f"Semgrep scan timed out after {self.config.timeout_seconds} seconds")
+            
         except Exception as e:
+            logger.error(f"Semgrep scan error: {str(e)}")
             raise RuntimeError(f"Semgrep scan error: {str(e)}")
+
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
         """Main method to scan a repository"""
