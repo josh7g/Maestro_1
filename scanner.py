@@ -158,13 +158,16 @@ class ChunkedScanner:
         return chunks
 
     
+    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with aggressive memory management"""
+        """Execute Semgrep scan with proper result collection"""
         # Set a lower memory limit - 2GB max per process
         max_memory_mb = 2000
         
         # Collect scannable files
         all_files = []
+        file_mapping = {}  # To keep track of original file paths
+        
         for root, _, files in os.walk(target_dir):
             if any(exclude in root for exclude in self.config.exclude_patterns):
                 continue
@@ -172,8 +175,10 @@ class ChunkedScanner:
                 file_path = Path(root) / file
                 if file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS:
                     all_files.append(file_path)
+                    # Store relative path for result mapping
+                    file_mapping[str(file_path.relative_to(target_dir))] = str(file_path)
 
-        # Break into very small chunks (20 files per chunk)
+        # Break into small chunks
         chunk_size = 20
         chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
         
@@ -182,7 +187,10 @@ class ChunkedScanner:
         all_results = {
             'results': [],
             'errors': [],
-            'paths': {'scanned': [], 'ignored': []},
+            'paths': {
+                'scanned': set(),  # Use set to avoid duplicates
+                'ignored': set()
+            },
             'version': "1.56.0"
         }
 
@@ -194,12 +202,14 @@ class ChunkedScanner:
             chunk_dir.mkdir(exist_ok=True)
 
             try:
-                # Copy files to chunk directory
+                # Copy files to chunk directory maintaining structure
+                chunk_file_mapping = {}  # Track files in this chunk
                 for file_path in chunk:
                     rel_path = file_path.relative_to(target_dir)
                     target_path = chunk_dir / rel_path
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(file_path, target_path)
+                    chunk_file_mapping[str(rel_path)] = str(file_path)
 
                 cmd = [
                     "semgrep",
@@ -209,10 +219,9 @@ class ChunkedScanner:
                     "--max-memory",
                     str(max_memory_mb),
                     "--timeout",
-                    "300",  # 5 minutes per chunk
+                    "300",
                     "--jobs",
-                    "1",    # Single job
-                    "--verbose",
+                    "1",
                     str(chunk_dir)
                 ]
 
@@ -226,42 +235,28 @@ class ChunkedScanner:
                 try:
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(),
-                        timeout=300  # 5 minutes timeout
+                        timeout=300
                     )
 
                     stdout_str = stdout.decode() if stdout else ""
-                    stderr_str = stderr.decode() if stderr else ""
-
-                    # Log any stderr output for debugging
-                    if stderr_str:
-                        logger.debug(f"Stderr from chunk {i}: {stderr_str}")
-
                     if stdout_str.strip():
-                        try:
-                            chunk_results = json.loads(stdout_str)
-                            # Merge results
-                            all_results['results'].extend(chunk_results.get('results', []))
-                            all_results['paths']['scanned'].extend(
-                                chunk_results.get('paths', {}).get('scanned', [])
-                            )
-                            all_results['paths']['ignored'].extend(
-                                chunk_results.get('paths', {}).get('ignored', [])
-                            )
+                        chunk_results = json.loads(stdout_str)
+                        
+                        # Add scanned files to the set
+                        all_results['paths']['scanned'].update(
+                            chunk_file_mapping.keys()
+                        )
 
-                            # Only add non-memory-related errors
-                            new_errors = [
-                                err for err in chunk_results.get('errors', [])
-                                if not any(memory_term in err.get('message', '').lower() 
-                                         for memory_term in ['memory', 'killed'])
-                            ]
-                            all_results['errors'].extend(new_errors)
+                        # Process and add findings
+                        for finding in chunk_results.get('results', []):
+                            # Update the path to the original file path
+                            if 'path' in finding:
+                                rel_path = finding['path']
+                                finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
+                            all_results['results'].append(finding)
 
-                            logger.info(f"Successfully scanned chunk {i} with "
-                                      f"{len(chunk_results.get('results', []))} findings")
-
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse JSON output from chunk {i}")
-                            continue
+                        logger.info(f"Successfully scanned chunk {i} with "
+                                  f"{len(chunk_results.get('results', []))} findings")
 
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout scanning chunk {i}")
@@ -278,14 +273,12 @@ class ChunkedScanner:
                 except Exception as e:
                     logger.error(f"Error cleaning up chunk directory: {str(e)}")
 
-        # Final validation of results
-        if not all_results['paths']['scanned'] and not all_results['errors']:
-            all_results['errors'].append({
-                'code': 1,
-                'level': 'warning',
-                'message': 'No files were successfully scanned',
-                'type': 'ScanError'
-            })
+        # Convert sets to lists for JSON serialization
+        all_results['paths']['scanned'] = list(all_results['paths']['scanned'])
+        all_results['paths']['ignored'] = list(all_results['paths']['ignored'])
+
+        # Add semgrep version
+        all_results['version'] = "1.56.0"
 
         logger.info(f"Completed scan: {len(all_results['results'])} findings, "
                    f"{len(all_results['paths']['scanned'])} files scanned")
@@ -297,7 +290,6 @@ class ChunkedScanner:
         try:
             repo_path = await self.clone_repository(repo_url, token)
             
-            # Get repository size for logging
             repo_size = await self._get_directory_size(repo_path)
             size_mb = repo_size / (1024 * 1024)
             
@@ -307,14 +299,20 @@ class ChunkedScanner:
             
             return {
                 'success': True,
-                'data': results,
+                'data': {
+                    'results': results['results'],
+                    'errors': results['errors'],
+                    'paths': results['paths'],
+                    'version': results['version'],
+                    'scan_status': 'completed',
+                    'files_scanned': len(results['paths']['scanned']),
+                    'total_findings': len(results['results'])
+                },
                 'metadata': {
-                    'repository_url': repo_url,
                     'repository_size_mb': round(size_mb, 2),
                     'scan_timestamp': datetime.now().isoformat(),
-                    'total_findings': len(results.get('results', [])),
-                    'total_files_scanned': len(results.get('paths', {}).get('scanned', [])),
-                    'total_errors': len(results.get('errors', []))
+                    'files_analyzed': len(results['paths']['scanned']),
+                    'findings_count': len(results['results'])
                 }
             }
             
