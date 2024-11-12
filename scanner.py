@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import logging
@@ -6,15 +5,12 @@ import json
 import psutil
 import tempfile
 import shutil
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import math
 import git
-from github import Github, GithubIntegration
 
 # Configure logging
 logging.basicConfig(
@@ -34,23 +30,27 @@ class ScanConfig:
     timeout_seconds: int = 3600
     max_retries: int = 3
     concurrent_processes: int = 2
-    exclude_patterns: List[str] = None
+    exclude_patterns: List[str] = field(default_factory=lambda: [
+        'node_modules',
+        'vendor',
+        'build',
+        'dist',
+        'target',
+        'venv',
+        'env',
+        '.git',
+        '.idea',
+        '.vscode'
+    ])
 
-    def __post_init__(self):
-        if self.exclude_patterns is None:
-            self.exclude_patterns = [
-                'node_modules',
-                'vendor',
-                'build',
-                'dist',
-                'target',
-                'venv',
-                'env',
-                '.git',
-                '.idea',
-                '.vscode'
-            ]
-
+@dataclass
+class ScanResult:
+    """Structure for scan results"""
+    findings: List[Dict] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    scanned_files: Set[str] = field(default_factory=set)
+    ignored_files: Set[str] = field(default_factory=set)
+    scan_time: datetime = field(default_factory=datetime.now)
 
 class GitProgress(git.RemoteProgress):
     """Progress monitor for git operations"""
@@ -60,12 +60,10 @@ class GitProgress(git.RemoteProgress):
         elif max_count:
             progress = (cur_count / max_count) * 100
             size_mb = cur_count / (1024 * 1024)
-            rate = size_mb / (max_count if max_count > 0 else 1)
-            logger.info(f"Git progress: {size_mb:.2f} MiB | {rate:.2f} MiB/s")
+            logger.info(f"Git progress: {progress:.1f}% ({size_mb:.2f} MB)")
 
-
-class ChunkedScanner:
-    """Scanner class for processing repositories in chunks"""
+class RepositoryScanner:
+    """Scanner class for processing repositories"""
 
     SCANNABLE_EXTENSIONS = {
         # Web development
@@ -76,55 +74,51 @@ class ChunkedScanner:
         '.py', '.rb', '.php', '.java', '.go', '.cs', '.cpp',
         '.c', '.h', '.hpp', '.scala', '.kt', '.rs',
         
-        # Mobile development
-        '.swift', '.m', '.mm', '.dart',
-        
         # Configuration and data
         '.json', '.yml', '.yaml', '.xml', '.conf', '.ini',
         '.env', '.properties',
         
-        # Scripts
-        '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd',
-        
-        # Template files
-        '.ejs', '.hbs', '.pug', '.jade', '.twig',
+        # Scripts and templates
+        '.sh', '.bash', '.ps1', '.ejs', '.hbs', '.pug',
         
         # Documentation
-        '.md', '.markdown', '.rst', '.txt'
+        '.md', '.txt'
     }
     
     def __init__(self, config: ScanConfig = ScanConfig()):
-        """Initialize scanner with configuration"""
         self.config = config
-        self.executor = ThreadPoolExecutor(max_workers=config.concurrent_processes)
-        self.repo_dir = None
         self.temp_dir = None
-        self._setup_temp_dir()
+        self.repo_dir = None
+        self.scan_result = ScanResult()
 
-    def _setup_temp_dir(self):
-        """Create a temporary directory for processing"""
+    async def __aenter__(self):
+        """Setup for async context manager"""
+        await self._setup()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup for async context manager"""
+        await self._cleanup()
+
+    async def _setup(self):
+        """Initialize scanner resources"""
         self.temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
         logger.info(f"Created temporary directory: {self.temp_dir}")
 
-    def _cleanup_temp_dir(self):
-        """Clean up temporary directory"""
+    async def _cleanup(self):
+        """Cleanup scanner resources"""
         try:
             if self.temp_dir and self.temp_dir.exists():
                 shutil.rmtree(self.temp_dir)
                 logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
         except Exception as e:
-            logger.error(f"Error cleaning up directory {self.temp_dir}: {e}")
+            logger.error(f"Error during cleanup: {e}")
 
-
-    async def clone_repository(self, repo_url: str, installation_token: str) -> Path:
-        """Clone repository with progress monitoring and size checks"""
+    async def clone_repository(self, repo_url: str, token: str) -> Path:
+        """Clone repository with authentication"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
-            auth_url = repo_url.replace(
-                'https://', 
-                f'https://x-access-token:{installation_token}@'
-            )
+            auth_url = repo_url.replace('https://', f'https://x-access-token:{token}@')
 
             logger.info(f"Cloning repository to {self.repo_dir}")
             
@@ -136,24 +130,24 @@ class ChunkedScanner:
             )
 
             repo_size = await self._get_directory_size(self.repo_dir)
-            size_mb = repo_size / (1024 * 1024)
-            logger.info(f"Successfully cloned repository: {size_mb:.2f} MB")
+            size_gb = repo_size / (1024 ** 3)
             
-            if repo_size > self.config.max_total_size_gb * 1024 * 1024 * 1024:
+            if size_gb > self.config.max_total_size_gb:
                 raise ValueError(
-                    f"Repository size ({size_mb:.2f} MB) exceeds "
+                    f"Repository size ({size_gb:.2f} GB) exceeds "
                     f"limit of {self.config.max_total_size_gb} GB"
                 )
 
+            logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
             return self.repo_dir
 
         except Exception as e:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
-            raise RuntimeError(f"Clone failed: {str(e)}") from e
+            raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _get_directory_size(self, directory: Path) -> int:
-        """Get directory size asynchronously"""
+        """Calculate directory size excluding ignored paths"""
         total_size = 0
         try:
             for dirpath, _, filenames in os.walk(directory):
@@ -168,184 +162,36 @@ class ChunkedScanner:
         return total_size
 
     def _is_scannable_file(self, file_path: Path) -> bool:
-        """Check if file should be scanned based on extension and path"""
+        """Determine if file should be scanned"""
         try:
             if any(exclude in file_path.parts for exclude in self.config.exclude_patterns):
                 return False
-                
-            is_scannable = file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS
-            if is_scannable:
-                logger.debug(f"Including file for scanning: {file_path}")
-            return is_scannable
+            return file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS
         except Exception as e:
-            logger.error(f"Error checking if file is scannable: {e}")
+            logger.error(f"Error checking file scannability: {e}")
             return False
 
-    def _log_repository_contents(self, directory: Path):
-        """Log repository contents for debugging"""
-        try:
-            logger.info("Repository contents:")
-            file_types = {}
-            excluded_files = []
-            included_files = []
-            
-            for dirpath, dirnames, filenames in os.walk(directory):
-                rel_path = Path(dirpath).relative_to(directory)
-                
-                if any(exclude in str(rel_path.parts) for exclude in self.config.exclude_patterns):
-                    logger.debug(f"Skipping excluded directory: {rel_path}")
-                    continue
-                    
-                for filename in filenames:
-                    file_path = Path(dirpath) / filename
-                    extension = file_path.suffix.lower()
-                    
-                    if extension not in file_types:
-                        file_types[extension] = 0
-                    file_types[extension] += 1
-                    
-                    if self._is_scannable_file(file_path):
-                        included_files.append(str(file_path.relative_to(directory)))
-                    else:
-                        excluded_files.append(str(file_path.relative_to(directory)))
-            
-            self._log_file_statistics(file_types, included_files, excluded_files)
-        
-        except Exception as e:
-            logger.error(f"Error logging repository contents: {e}")
-            raise
-
-    def _log_file_statistics(self, file_types: Dict[str, int], 
-                           included_files: List[str], 
-                           excluded_files: List[str]):
-        """Log statistics about repository files"""
-        try:
-            logger.info("\nFile types found:")
-            for ext, count in file_types.items():
-                logger.info(f"  {ext}: {count} files")
-                
-            logger.info(f"\nTotal files to scan: {len(included_files)}")
-            logger.info("Files to be scanned:")
-            for file in included_files[:10]:
-                logger.info(f"  {file}")
-            if len(included_files) > 10:
-                logger.info(f"  ... and {len(included_files) - 10} more")
-                
-            logger.info(f"\nTotal excluded files: {len(excluded_files)}")
-            logger.info("Excluded files (first 10):")
-            for file in excluded_files[:10]:
-                logger.info(f"  {file}")
-            if len(excluded_files) > 10:
-                logger.info(f"  ... and {len(excluded_files) - 10} more")
-        
-        except Exception as e:
-            logger.error(f"Error logging file statistics: {e}")
-
-    def _chunk_directory(self, directory: Path) -> List[List[Path]]:
-        """Split directory into manageable chunks"""
-        try:
-            all_files = []
-            current_chunk = []
-            current_chunk_size = 0
-
-            for dirpath, _, filenames in os.walk(directory):
-                if any(exclude in dirpath for exclude in self.config.exclude_patterns):
-                    continue
-                
-                for filename in filenames:
-                    file_path = Path(dirpath) / filename
-                    if not self._is_scannable_file(file_path):
-                        continue
-
-                    file_size = file_path.stat().st_size
-                    if file_size > self.config.max_file_size_mb * 1024 * 1024:
-                        logger.warning(
-                            f"Skipping large file: {file_path} "
-                            f"({file_size / (1024**2):.2f} MB)"
-                        )
-                        continue
-                    
-                    if current_chunk_size + file_size > self.config.chunk_size_mb * 1024 * 1024:
-                        if current_chunk:
-                            all_files.append(current_chunk)
-                        current_chunk = [file_path]
-                        current_chunk_size = file_size
-                    else:
-                        current_chunk.append(file_path)
-                        current_chunk_size += file_size
-
-            if current_chunk:
-                all_files.append(current_chunk)
-
-            logger.info(f"Split repository into {len(all_files)} chunks")
-            return all_files
-
-        except Exception as e:
-            logger.error(f"Error chunking directory: {e}")
-            raise
-
-    
-    async def _scan_chunk(self, chunk: List[Path], chunk_index: int, retries: int = 0) -> Optional[Dict]:
-        """Scan a chunk of files with Semgrep"""
-        if retries >= self.config.max_retries:
-            logger.error(f"Max retries reached for chunk {chunk_index}")
-            return None
-
-        chunk_dir = self.temp_dir / f"chunk_{chunk_index}"
-        chunk_dir.mkdir(exist_ok=True)
-
-        try:
-            await self._setup_chunk_directory(chunk, chunk_dir)
-            return await self._run_semgrep_scan(chunk, chunk_index, chunk_dir, retries)
-        except Exception as e:
-            logger.error(f"Error scanning chunk {chunk_index}: {e}")
-            return await self._handle_retry(chunk, chunk_index, retries)
-        finally:
-            if chunk_dir.exists():
-                shutil.rmtree(chunk_dir)
-
-    async def _setup_chunk_directory(self, chunk: List[Path], chunk_dir: Path):
-        """Set up directory structure for chunk scanning"""
-        try:
-            for file_path in chunk:
-                relative_path = file_path.relative_to(self.repo_dir)
-                target_path = chunk_dir / relative_path
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                if not target_path.exists():
-                    shutil.copy2(file_path, target_path)
-                    os.chmod(target_path, 0o644)
-                    
-        except Exception as e:
-            logger.error(f"Error setting up chunk directory: {e}")
-            raise
-
-    async def _run_semgrep_scan(self, chunk: List[Path], chunk_index: int, 
-                               chunk_dir: Path, retries: int) -> Optional[Dict]:
-        """Run Semgrep scan on prepared directory"""
+    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+        """Execute Semgrep scan with proper configuration"""
         cmd = [
             "semgrep",
+            "scan",
             "--config=auto",
-            "--metrics=off",
-            "--skip-git",
             "--json",
             "--timeout",
             str(self.config.timeout_seconds),
             "--max-memory",
             f"{int(psutil.virtual_memory().total * self.config.max_memory_percent / 100 / (1024 * 1024))}M",
-            "--max-files",
-            str(len(chunk)),
-            "."
+            "--disable-metrics",
+            "--disable-version-check",
+            str(target_dir)
         ]
 
-        logger.info(f"Running Semgrep on chunk {chunk_index} with {len(chunk)} files")
-        
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(chunk_dir)
+                stderr=asyncio.subprocess.PIPE
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -353,151 +199,79 @@ class ChunkedScanner:
                 timeout=self.config.timeout_seconds
             )
 
-            return await self._process_semgrep_output(
-                stdout,
-                stderr,
-                process.returncode,
-                chunk_index,
-                chunk,
-                retries
-            )
+            if process.returncode != 0:
+                error_msg = stderr.decode() if stderr else "No error message"
+                raise RuntimeError(f"Semgrep scan failed: {error_msg}")
+
+            return json.loads(stdout.decode())
 
         except asyncio.TimeoutError:
-            if 'process' in locals():
-                process.terminate()
-            logger.error(f"Timeout scanning chunk {chunk_index}")
-            return await self._handle_retry(chunk, chunk_index, retries)
+            process.terminate()
+            raise RuntimeError("Semgrep scan timed out")
+        except json.JSONDecodeError:
+            raise RuntimeError("Failed to parse Semgrep output")
         except Exception as e:
-            logger.error(f"Error during Semgrep scan: {e}")
-            return await self._handle_retry(chunk, chunk_index, retries)
+            raise RuntimeError(f"Semgrep scan error: {str(e)}")
 
-    async def _process_semgrep_output(self, stdout: bytes, stderr: bytes,
-                                    returncode: int, chunk_index: int,
-                                    chunk: List[Path], retries: int) -> Optional[Dict]:
-        """Process Semgrep output and handle errors"""
+    async def scan_repository(self, repo_url: str, token: str) -> Dict:
+        """Main method to scan a repository"""
         try:
-            if returncode != 0:
-                error_msg = stderr.decode() if stderr else "No error message"
-                logger.error(f"Semgrep failed for chunk {chunk_index}: {error_msg}")
-                return await self._handle_retry(chunk, chunk_index, retries)
+            # Clone and scan repository
+            repo_path = await self.clone_repository(repo_url, token)
+            scan_results = await self._run_semgrep_scan(repo_path)
 
-            result = json.loads(stdout.decode())
-            logger.info(
-                f"Successfully scanned chunk {chunk_index} "
-                f"with {len(result.get('results', []))} findings"
-            )
-            return result
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Semgrep output: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Error processing Semgrep output: {e}")
-            return None
+            # Process results
+            findings = scan_results.get('results', [])
+            self.scan_result.findings = findings
+            
+            # Get scanned and ignored files
+            for file in Path(repo_path).rglob('*'):
+                if file.is_file():
+                    rel_path = str(file.relative_to(repo_path))
+                    if self._is_scannable_file(file):
+                        self.scan_result.scanned_files.add(rel_path)
+                    else:
+                        self.scan_result.ignored_files.add(rel_path)
 
-    async def _handle_retry(self, chunk: List[Path], chunk_index: int,
-                          retries: int) -> Optional[Dict]:
-        """Handle retry logic for failed scans"""
-        if retries < self.config.max_retries:
-            logger.info(f"Retrying chunk {chunk_index}")
-            return await self._scan_chunk(chunk, chunk_index, retries + 1)
-        return None
-
-    def _merge_results(self, chunk_results: List[Optional[Dict]]) -> Dict:
-        """Merge results from all chunks"""
-        try:
-            merged = {
-                'results': [],
-                'errors': [],
-                'paths': {
-                    'scanned': set(),
-                    'ignored': set()
+            return {
+                'success': True,
+                'data': {
+                    'findings': self.scan_result.findings,
+                    'errors': self.scan_result.errors,
+                    'paths': {
+                        'scanned': list(self.scan_result.scanned_files),
+                        'ignored': list(self.scan_result.ignored_files)
+                    }
+                },
+                'metadata': {
+                    'scan_time': self.scan_result.scan_time.isoformat(),
+                    'total_files_scanned': len(self.scan_result.scanned_files),
+                    'total_files_ignored': len(self.scan_result.ignored_files),
+                    'total_findings': len(self.scan_result.findings)
                 }
             }
 
-            for result in chunk_results:
-                if not result:
-                    continue
-                    
-                merged['results'].extend(result.get('results', []))
-                merged['errors'].extend(result.get('errors', []))
-                
-                paths = result.get('paths', {})
-                merged['paths']['scanned'].update(paths.get('scanned', []))
-                merged['paths']['ignored'].update(paths.get('ignored', []))
-
-            merged['paths']['scanned'] = list(merged['paths']['scanned'])
-            merged['paths']['ignored'] = list(merged['paths']['ignored'])
-
-            return merged
         except Exception as e:
-            logger.error(f"Error merging results: {e}")
-            raise
-
-    async def scan_repository(self, repo_url: str, installation_token: str) -> Dict:
-        """Main method to scan a repository"""
-        try:
-            await self.clone_repository(repo_url, installation_token)
-            self._log_repository_contents(self.repo_dir)
-            
-            chunks = self._chunk_directory(self.repo_dir)
-            if not chunks:
-                logger.warning("No files to scan found in repository!")
-                return {
-                    'results': [],
-                    'errors': ['No scannable files found in repository'],
-                    'paths': {'scanned': [], 'ignored': []}
+            logger.error(f"Scan failed: {str(e)}", exc_info=True)
+            return {
+                'success': False,
+                'error': {
+                    'message': str(e),
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat()
                 }
-
-            logger.info(f"Starting concurrent scan of {len(chunks)} chunks")
-            tasks = [asyncio.create_task(self._scan_chunk(chunk, i)) 
-                    for i, chunk in enumerate(chunks)]
-
-            chunk_results = await asyncio.gather(*tasks)
-            logger.info("All chunks scanned successfully")
-
-            final_results = self._merge_results(chunk_results)
-            logger.info(f"Scan completed with {len(final_results['results'])} findings")
-            return final_results
-
-        except Exception as e:
-            logger.error(f"Repository scan failed: {str(e)}")
-            raise
-        finally:
-            self._cleanup_temp_dir()
-
+            }
 
 async def scan_repository_handler(repo_url: str, installation_token: str) -> Dict:
-    """Handler function for Flask route that manages repository scanning process"""
-    scanner = ChunkedScanner(ScanConfig(
+    """Handler function for web routes"""
+    config = ScanConfig(
         max_file_size_mb=50,
         max_total_size_gb=2,
         max_memory_percent=80,
-        chunk_size_mb=500,
         timeout_seconds=3600,
         max_retries=3,
         concurrent_processes=2
-    ))
+    )
     
-    try:
-        results = await scanner.scan_repository(repo_url, installation_token)
-        
-        return {
-            'success': True,
-            'data': results,
-            'metadata': {
-                'scan_time': datetime.now().isoformat(),
-                'total_files_scanned': len(results['paths']['scanned']),
-                'total_files_ignored': len(results['paths']['ignored']),
-                'total_findings': len(results['results'])
-            }
-        }
-    except Exception as e:
-        logger.error(f"Scan failed: {str(e)}", exc_info=True)
-        return {
-            'success': False,
-            'error': {
-                'message': str(e),
-                'type': type(e).__name__,
-                'timestamp': datetime.now().isoformat()
-            }
-        }
+    async with RepositoryScanner(config) as scanner:
+        return await scanner.scan_repository(repo_url, installation_token)
