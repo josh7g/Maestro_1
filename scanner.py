@@ -159,51 +159,81 @@ class ChunkedScanner:
 
     
     
+    
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with proper result collection"""
-        # Set a lower memory limit - 2GB max per process
+        """Execute Semgrep scan with enhanced security rules"""
         max_memory_mb = 2000
         
-        # Collect scannable files
+        # Define security rulesets
+        security_rules = [
+            "p/default",  # Default security rules
+            "p/security-audit",  # Comprehensive security audit
+            "p/owasp-top-ten",  # OWASP Top 10
+            "p/javascript",  # JavaScript-specific rules
+            "p/react",      # React-specific rules
+            "p/nodejs",     # Node.js rules
+            "p/secrets"     # Secret detection
+        ]
+        
         all_files = []
-        file_mapping = {}  # To keep track of original file paths
+        file_mapping = {}
+        
+        # Collect scannable files with focus on security-sensitive files
+        sensitive_extensions = {
+            # Configuration files
+            '.env', '.config', '.json', '.yaml', '.yml',
+            
+            # Web files
+            '.js', '.jsx', '.ts', '.tsx', '.html', '.php',
+            
+            # Backend files
+            '.py', '.rb', '.java', '.go', '.cs',
+            
+            # Data files
+            '.sql', '.graphql',
+            
+            # Security files
+            '.pem', '.key', '.cert'
+        }
         
         for root, _, files in os.walk(target_dir):
             if any(exclude in root for exclude in self.config.exclude_patterns):
                 continue
             for file in files:
                 file_path = Path(root) / file
-                if file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS:
+                if (file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS or 
+                    file_path.suffix.lower() in sensitive_extensions):
                     all_files.append(file_path)
-                    # Store relative path for result mapping
                     file_mapping[str(file_path.relative_to(target_dir))] = str(file_path)
 
-        # Break into small chunks
         chunk_size = 20
         chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
         
-        logger.info(f"Split scanning into {len(chunks)} chunks of {chunk_size} files each")
+        logger.info(f"Starting security scan with {len(chunks)} chunks")
 
         all_results = {
             'results': [],
             'errors': [],
             'paths': {
-                'scanned': set(),  # Use set to avoid duplicates
+                'scanned': set(),
                 'ignored': set()
             },
-            'version': "1.56.0"
+            'version': "1.56.0",
+            'security_summary': {
+                'high_severity': 0,
+                'medium_severity': 0,
+                'low_severity': 0,
+                'categories': set()
+            }
         }
 
         for i, chunk in enumerate(chunks, 1):
-            logger.info(f"Scanning chunk {i}/{len(chunks)} with {len(chunk)} files")
-            
-            # Create temporary directory for this chunk
             chunk_dir = target_dir / f"chunk_{i}"
             chunk_dir.mkdir(exist_ok=True)
 
             try:
-                # Copy files to chunk directory maintaining structure
-                chunk_file_mapping = {}  # Track files in this chunk
+                # Set up chunk files
+                chunk_file_mapping = {}
                 for file_path in chunk:
                     rel_path = file_path.relative_to(target_dir)
                     target_path = chunk_dir / rel_path
@@ -211,133 +241,271 @@ class ChunkedScanner:
                     shutil.copy2(file_path, target_path)
                     chunk_file_mapping[str(rel_path)] = str(file_path)
 
-                cmd = [
-                    "semgrep",
-                    "scan",
-                    "--config=auto",
-                    "--json",
-                    "--max-memory",
-                    str(max_memory_mb),
-                    "--timeout",
-                    "300",
-                    "--jobs",
-                    "1",
-                    str(chunk_dir)
-                ]
+                # Run scan with each ruleset
+                for ruleset in security_rules:
+                    cmd = [
+                        "semgrep",
+                        "scan",
+                        f"--config={ruleset}",
+                        "--json",
+                        "--max-memory",
+                        str(max_memory_mb),
+                        "--timeout",
+                        "300",
+                        "--jobs",
+                        "1",
+                        "--verbose",
+                        str(chunk_dir)
+                    ]
 
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(chunk_dir)
-                )
-
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(),
-                        timeout=300
-                    )
-
-                    stdout_str = stdout.decode() if stdout else ""
-                    if stdout_str.strip():
-                        chunk_results = json.loads(stdout_str)
-                        
-                        # Add scanned files to the set
-                        all_results['paths']['scanned'].update(
-                            chunk_file_mapping.keys()
+                    try:
+                        process = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=str(chunk_dir)
                         )
 
-                        # Process and add findings
-                        for finding in chunk_results.get('results', []):
-                            # Update the path to the original file path
-                            if 'path' in finding:
-                                rel_path = finding['path']
-                                finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
-                            all_results['results'].append(finding)
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(),
+                            timeout=300
+                        )
 
-                        logger.info(f"Successfully scanned chunk {i} with "
-                                  f"{len(chunk_results.get('results', []))} findings")
+                        stdout_str = stdout.decode() if stdout else ""
+                        if stdout_str.strip():
+                            chunk_results = json.loads(stdout_str)
+                            
+                            # Process findings
+                            for finding in chunk_results.get('results', []):
+                                # Update file path
+                                if 'path' in finding:
+                                    rel_path = finding['path']
+                                    finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
 
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout scanning chunk {i}")
-                    continue
+                                # Add ruleset info
+                                finding['ruleset'] = ruleset
 
-            except Exception as e:
-                logger.error(f"Error processing chunk {i}: {str(e)}")
-                continue
+                                # Update security summary
+                                severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
+                                if severity == 'ERROR' or severity == 'HIGH':
+                                    all_results['security_summary']['high_severity'] += 1
+                                elif severity == 'WARNING' or severity == 'MEDIUM':
+                                    all_results['security_summary']['medium_severity'] += 1
+                                elif severity == 'INFO' or severity == 'LOW':
+                                    all_results['security_summary']['low_severity'] += 1
+
+                                # Track categories
+                                category = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
+                                all_results['security_summary']['categories'].add(category)
+
+                                all_results['results'].append(finding)
+
+                            # Track scanned files
+                            all_results['paths']['scanned'].update(chunk_file_mapping.keys())
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout scanning chunk {i} with ruleset {ruleset}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error scanning chunk {i} with ruleset {ruleset}: {str(e)}")
+                        continue
+
+                logger.info(f"Completed chunk {i}/{len(chunks)}")
 
             finally:
-                # Cleanup chunk directory
                 try:
                     shutil.rmtree(chunk_dir)
                 except Exception as e:
                     logger.error(f"Error cleaning up chunk directory: {str(e)}")
 
-        # Convert sets to lists for JSON serialization
+        # Prepare final results
         all_results['paths']['scanned'] = list(all_results['paths']['scanned'])
         all_results['paths']['ignored'] = list(all_results['paths']['ignored'])
+        all_results['security_summary']['categories'] = list(all_results['security_summary']['categories'])
 
-        # Add semgrep version
-        all_results['version'] = "1.56.0"
-
-        logger.info(f"Completed scan: {len(all_results['results'])} findings, "
-                   f"{len(all_results['paths']['scanned'])} files scanned")
+        logger.info(
+            f"Scan completed: {len(all_results['results'])} findings "
+            f"({all_results['security_summary']['high_severity']} high, "
+            f"{all_results['security_summary']['medium_severity']} medium, "
+            f"{all_results['security_summary']['low_severity']} low severity)"
+        )
         
         return all_results
 
-    async def scan_repository(self, repo_url: str, token: str) -> Dict:
-        """Main method to scan a repository"""
-        try:
-            repo_path = await self.clone_repository(repo_url, token)
-            
-            repo_size = await self._get_directory_size(repo_path)
-            size_mb = repo_size / (1024 * 1024)
-            
-            logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
-            
-            results = await self._run_semgrep_scan(repo_path)
-            
-            return {
-                'success': True,
-                'data': {
-                    'results': results['results'],
-                    'errors': results['errors'],
-                    'paths': results['paths'],
-                    'version': results['version'],
-                    'scan_status': 'completed',
-                    'files_scanned': len(results['paths']['scanned']),
-                    'total_findings': len(results['results'])
-                },
-                'metadata': {
-                    'repository_size_mb': round(size_mb, 2),
-                    'scan_timestamp': datetime.now().isoformat(),
-                    'files_analyzed': len(results['paths']['scanned']),
-                    'findings_count': len(results['results'])
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Scan failed: {str(e)}")
-            return {
-                'success': False,
-                'error': {
-                    'message': str(e),
-                    'type': type(e).__name__,
-                    'timestamp': datetime.now().isoformat()
-                }
-            }
-        finally:
-            await self._cleanup()
 
+    
+    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+        """Execute Semgrep scan with enhanced security rules"""
+        max_memory_mb = 2000
+        
+        # Define security rulesets
+        security_rules = [
+            "p/default",  # Default security rules
+            "p/security-audit",  # Comprehensive security audit
+            "p/owasp-top-ten",  # OWASP Top 10
+            "p/javascript",  # JavaScript-specific rules
+            "p/react",      # React-specific rules
+            "p/nodejs",     # Node.js rules
+            "p/secrets"     # Secret detection
+        ]
+        
+        all_files = []
+        file_mapping = {}
+        
+        # Collect scannable files with focus on security-sensitive files
+        sensitive_extensions = {
+            # Configuration files
+            '.env', '.config', '.json', '.yaml', '.yml',
+            
+            # Web files
+            '.js', '.jsx', '.ts', '.tsx', '.html', '.php',
+            
+            # Backend files
+            '.py', '.rb', '.java', '.go', '.cs',
+            
+            # Data files
+            '.sql', '.graphql',
+            
+            # Security files
+            '.pem', '.key', '.cert'
+        }
+        
+        for root, _, files in os.walk(target_dir):
+            if any(exclude in root for exclude in self.config.exclude_patterns):
+                continue
+            for file in files:
+                file_path = Path(root) / file
+                if (file_path.suffix.lower() in self.SCANNABLE_EXTENSIONS or 
+                    file_path.suffix.lower() in sensitive_extensions):
+                    all_files.append(file_path)
+                    file_mapping[str(file_path.relative_to(target_dir))] = str(file_path)
 
-class GitProgress(git.RemoteProgress):
-    """Progress monitor for git operations"""
-    def update(self, op_code, cur_count, max_count=None, message=''):
-        if message:
-            logger.info(f"Git progress: {message}")
-        elif max_count:
-            progress = (cur_count / max_count) * 100
-            logger.info(f"Git progress: {progress:.1f}%")
+        chunk_size = 20
+        chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
+        
+        logger.info(f"Starting security scan with {len(chunks)} chunks")
+
+        all_results = {
+            'results': [],
+            'errors': [],
+            'paths': {
+                'scanned': set(),
+                'ignored': set()
+            },
+            'version': "1.56.0",
+            'security_summary': {
+                'high_severity': 0,
+                'medium_severity': 0,
+                'low_severity': 0,
+                'categories': set()
+            }
+        }
+
+        for i, chunk in enumerate(chunks, 1):
+            chunk_dir = target_dir / f"chunk_{i}"
+            chunk_dir.mkdir(exist_ok=True)
+
+            try:
+                # Set up chunk files
+                chunk_file_mapping = {}
+                for file_path in chunk:
+                    rel_path = file_path.relative_to(target_dir)
+                    target_path = chunk_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, target_path)
+                    chunk_file_mapping[str(rel_path)] = str(file_path)
+
+                # Run scan with each ruleset
+                for ruleset in security_rules:
+                    cmd = [
+                        "semgrep",
+                        "scan",
+                        f"--config={ruleset}",
+                        "--json",
+                        "--max-memory",
+                        str(max_memory_mb),
+                        "--timeout",
+                        "300",
+                        "--jobs",
+                        "1",
+                        "--verbose",
+                        str(chunk_dir)
+                    ]
+
+                    try:
+                        process = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=str(chunk_dir)
+                        )
+
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(),
+                            timeout=300
+                        )
+
+                        stdout_str = stdout.decode() if stdout else ""
+                        if stdout_str.strip():
+                            chunk_results = json.loads(stdout_str)
+                            
+                            # Process findings
+                            for finding in chunk_results.get('results', []):
+                                # Update file path
+                                if 'path' in finding:
+                                    rel_path = finding['path']
+                                    finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
+
+                                # Add ruleset info
+                                finding['ruleset'] = ruleset
+
+                                # Update security summary
+                                severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
+                                if severity == 'ERROR' or severity == 'HIGH':
+                                    all_results['security_summary']['high_severity'] += 1
+                                elif severity == 'WARNING' or severity == 'MEDIUM':
+                                    all_results['security_summary']['medium_severity'] += 1
+                                elif severity == 'INFO' or severity == 'LOW':
+                                    all_results['security_summary']['low_severity'] += 1
+
+                                # Track categories
+                                category = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
+                                all_results['security_summary']['categories'].add(category)
+
+                                all_results['results'].append(finding)
+
+                            # Track scanned files
+                            all_results['paths']['scanned'].update(chunk_file_mapping.keys())
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout scanning chunk {i} with ruleset {ruleset}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error scanning chunk {i} with ruleset {ruleset}: {str(e)}")
+                        continue
+
+                logger.info(f"Completed chunk {i}/{len(chunks)}")
+
+            finally:
+                try:
+                    shutil.rmtree(chunk_dir)
+                except Exception as e:
+                    logger.error(f"Error cleaning up chunk directory: {str(e)}")
+
+        # Prepare final results
+        all_results['paths']['scanned'] = list(all_results['paths']['scanned'])
+        all_results['paths']['ignored'] = list(all_results['paths']['ignored'])
+        all_results['security_summary']['categories'] = list(all_results['security_summary']['categories'])
+
+        logger.info(
+            f"Scan completed: {len(all_results['results'])} findings "
+            f"({all_results['security_summary']['high_severity']} high, "
+            f"{all_results['security_summary']['medium_severity']} medium, "
+            f"{all_results['security_summary']['low_severity']} low severity)"
+        )
+        
+        return all_results
+
 
 async def scan_repository_handler(repo_url: str, installation_token: str, user_id: str) -> Dict:
     """Handler function for web routes"""
