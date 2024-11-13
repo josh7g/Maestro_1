@@ -1,44 +1,18 @@
-# Web Framework and Extensions
 Flask==3.0.3
 Flask-CORS==4.0.0
-Werkzeug==3.0.1
+PyGithub==2.1.1
+python-dotenv==1.0.1
 gunicorn==21.2.0
-uvicorn==0.27.1
-asgiref==3.7.2
-
-# Database
-SQLAlchemy==2.0.27
+semgrep==1.56.0
+Werkzeug==3.0.1
+requests==2.31.0
 flask-sqlalchemy==3.1.1
 flask-migrate==4.0.5
 psycopg2-binary==2.9.9
 alembic==1.13.1
-
-# GitHub Integration
-PyGithub==2.1.1
-gitpython==3.1.42
-
-# Security and Scanning
-semgrep==1.56.0
-
-# Utilities
-python-dotenv==1.0.1
-requests==2.31.0
+SQLAlchemy
 psutil==5.9.8
+gitpython==3.1.42
 aiofiles==23.2.1
-
-# Async Support
-aiohttp==3.9.3
-asyncio==3.4.3
-aiostream==0.5.2
-
-# Type Hints
-typing-extensions==4.9.0
-mypy-extensions==1.0.0
-types-requests==2.31.0.20240218
-types-PyYAML==6.0.12.12
-
-# Development Tools
-black==24.2.0
-flake8==7.0.0
-pytest==8.0.1
-pytest-asyncio==0.23.5
+uvicorn==0.27.1
+asgiref==3.7.2
