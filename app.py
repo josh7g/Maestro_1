@@ -666,14 +666,22 @@ async def scan_repository():
                 }
             }), 500
 
-        # Run the scanner
+        # Run the enhanced scanner
         try:
-            scan_results = await scan_repository_handler(repo_url, installation_token, user_id)
+            scan_results = await scan_repository_handler(
+                repo_url=repo_url,
+                installation_token=installation_token,
+                user_id=user_id,
+                db_session=db.session,
+                include_raw_output=True
+            )
             
             # Update database with results
             if scan_results['success']:
                 analysis.status = 'completed'
-                analysis.results = scan_results['data']
+                analysis.results = scan_results['data']['processed_results']
+                if 'raw_semgrep_output' in scan_results['data']:
+                    analysis.raw_results = scan_results['data']['raw_semgrep_output']
             else:
                 analysis.status = 'failed'
                 analysis.error = scan_results['error']['message']
@@ -681,6 +689,7 @@ async def scan_repository():
             db.session.commit()
             logger.info(f"Updated analysis record {analysis.id} with status {analysis.status}")
 
+            # Return enhanced response
             return jsonify({
                 'success': scan_results['success'],
                 'data': {
@@ -688,7 +697,9 @@ async def scan_repository():
                     'repository': repo_name,
                     'user_id': user_id,
                     'analysis_id': analysis.id,
-                    'status': analysis.status
+                    'status': analysis.status,
+                    'metadata': scan_results['data'].get('metadata', {}),
+                    'stats': scan_results['data'].get('processed_results', {}).get('stats', {})
                 }
             })
 
