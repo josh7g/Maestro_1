@@ -102,7 +102,68 @@ def init_database():
             raise
         finally:
             db.session.remove()
+def format_private_key(key_data: str) -> str:
+    """Format the private key correctly for GitHub integration"""
+    try:
+        if not key_data:
+            raise ValueError("Private key is empty")
+        
+        key_data = key_data.strip()
+        
+        # Handle newlines
+        if '\\n' in key_data:
+            parts = key_data.split('\\n')
+            key_data = '\n'.join(part.strip() for part in parts if part.strip())
+        elif '\n' not in key_data:
+            # Format long string into proper key format
+            key_length = len(key_data)
+            if key_length < 64:
+                raise ValueError("Key content too short")
+            
+            if not key_data.startswith('-----BEGIN'):
+                key_data = (
+                    '-----BEGIN RSA PRIVATE KEY-----\n' +
+                    '\n'.join(key_data[i:i+64] for i in range(0, len(key_data), 64)) +
+                    '\n-----END RSA PRIVATE KEY-----'
+                )
+        
+        # Ensure proper header and footer
+        if not key_data.startswith('-----BEGIN RSA PRIVATE KEY-----'):
+            key_data = '-----BEGIN RSA PRIVATE KEY-----\n' + key_data
+        if not key_data.endswith('-----END RSA PRIVATE KEY-----'):
+            key_data = key_data + '\n-----END RSA PRIVATE KEY-----'
+        
+        lines = key_data.split('\n')
+        if len(lines) < 3:
+            raise ValueError("Invalid key format - too few lines")
+        
+        logger.info("Private key formatted successfully")
+        return key_data
+        
+    except Exception as e:
+        logger.error(f"Error formatting private key: {str(e)}")
+        raise ValueError(f"Private key formatting failed: {str(e)}")
 
+def init_github():
+    """Initialize GitHub integration with error handling"""
+    try:
+        APP_ID = os.getenv('GITHUB_APP_ID')
+        WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
+        PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
+        
+        if not all([APP_ID, WEBHOOK_SECRET, PRIVATE_KEY]):
+            raise ValueError("Missing required GitHub environment variables")
+        
+        formatted_key = format_private_key(PRIVATE_KEY)
+        git_integration = GithubIntegration(
+            integration_id=int(APP_ID),
+            private_key=formatted_key,
+        )
+        logger.info("GitHub Integration initialized successfully")
+        return git_integration
+    except Exception as e:
+        logger.error(f"GitHub integration error: {str(e)}")
+        raise
 # Initialize GitHub integration
 def init_github():
     """Initialize GitHub integration with error handling"""
