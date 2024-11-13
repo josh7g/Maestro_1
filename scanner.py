@@ -311,7 +311,8 @@ async def scan_repository_handler(
     try:
         config = ScanConfig(include_raw_output=include_raw_output)
         
-        async with EnhancedScanner(config, db_session) as scanner:
+        # Changed from EnhancedScanner to ChunkedScanner here
+        async with ChunkedScanner(config, db_session) as scanner:
             results = await scanner.scan_repository(
                 repo_url,
                 installation_token,
