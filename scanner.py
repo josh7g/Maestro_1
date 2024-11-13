@@ -78,17 +78,6 @@ class ChunkedScanner:
         '.md', '.txt', '.sql', '.graphql'
     }
     
-    SEMGREP_RULES = [
-        "p/security-audit",
-        "p/owasp-top-ten",
-        "p/javascript",
-        "p/python",
-        "p/java",
-        "p/sql-injection",
-        "p/xss",
-        "p/secrets"
-    ]
-    
     def __init__(self, config: ScanConfig = ScanConfig()):
         self.config = config
         self.temp_dir = None
@@ -186,8 +175,12 @@ class ChunkedScanner:
             except Exception as e:
                 logger.error(f"Error copying file {file_path}: {e}")
         return chunk_file_mapping
+    
+   
+    
+
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with optimized configuration"""
+        """Execute Semgrep scan with fixed configuration"""
         max_memory_mb = 2000
         all_files = []
         file_mapping = {}
@@ -232,19 +225,28 @@ class ChunkedScanner:
             try:
                 chunk_file_mapping = await self._prepare_chunk(chunk, chunk_dir)
                 
-                # Basic semgrep command
+                # Build semgrep command with fixed configuration
                 cmd = [
                     "semgrep",
                     "scan",
                     "--json",
-                    "--metrics=off",
                     "--max-memory", str(max_memory_mb),
                     "--timeout", "300",
                     "--severity", "INFO"
                 ]
                 
-                # Add config rules
-                cmd.extend(["--config", "auto"])
+                # Add specific rule configurations
+                rule_sets = [
+                    "p/default",
+                    "p/security-audit",
+                    "p/owasp-top-ten",
+                    "p/javascript",
+                    "p/python",
+                    "p/java"
+                ]
+                
+                for rule in rule_sets:
+                    cmd.extend(["--config", rule])
                 
                 # Add target directory
                 cmd.append(str(chunk_dir))
@@ -472,4 +474,4 @@ if __name__ == "__main__":
         ))
         print(json.dumps(result, indent=2))
     else:
-        parser.print_help()
+        parser.print_help() 
