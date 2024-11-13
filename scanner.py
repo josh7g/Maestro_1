@@ -50,7 +50,7 @@ class ScanConfig:
         '*.map'
     ])
 
-class EnhancedScanner:
+class ChunkedScanner:
     """Enhanced scanner combining async performance with comprehensive results"""
     
     SCANNABLE_EXTENSIONS = {
