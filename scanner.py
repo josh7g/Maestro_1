@@ -1,3 +1,4 @@
+
 import os
 import subprocess
 import logging
@@ -43,7 +44,8 @@ class ScanConfig:
         '.vscode',
         '__pycache__',
         '*.min.js',
-        '*.bundle.js'
+        '*.bundle.js',
+        '*.map'
     ])
 
 class GitProgress(git.RemoteProgress):
@@ -72,16 +74,47 @@ class ChunkedScanner:
         
         # Scripts and templates
         '.sh', '.bash', '.ps1', '.ejs', '.hbs', '.pug',
-        '.tpl', '.template',
         
         # Documentation and others
         '.md', '.txt', '.sql', '.graphql'
+    }
+    
+    # Define comprehensive rulesets by language
+    SEMGREP_RULESETS = {
+        'javascript': [
+            'p/javascript',
+            'p/nodejs',
+            'p/react',
+            'p/typescript',
+            'p/express'
+        ],
+        'python': [
+            'p/python',
+            'p/flask',
+            'p/django'
+        ],
+        'java': [
+            'p/java',
+            'p/spring'
+        ],
+        'csharp': [
+            'p/csharp'
+        ],
+        'security': [
+            'p/security-audit',
+            'p/owasp-top-ten',
+            'p/jwt',
+            'p/secrets',
+            'p/sql-injection',
+            'p/xss'
+        ]
     }
     
     def __init__(self, config: ScanConfig = ScanConfig()):
         self.config = config
         self.temp_dir = None
         self.repo_dir = None
+        self.detected_languages = set()
 
     async def __aenter__(self):
         await self._setup()
@@ -103,6 +136,20 @@ class ChunkedScanner:
                 logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    def _detect_language(self, file_extension: str) -> Optional[str]:
+        """Detect programming language from file extension"""
+        extension_map = {
+            '.js': 'javascript',
+            '.jsx': 'javascript',
+            '.ts': 'javascript',
+            '.tsx': 'javascript',
+            '.vue': 'javascript',
+            '.py': 'python',
+            '.java': 'java',
+            '.cs': 'csharp'
+        }
+        return extension_map.get(file_extension.lower())
 
     async def _get_directory_size(self, directory: Path) -> int:
         """Calculate directory size excluding ignored paths"""
@@ -172,20 +219,23 @@ class ChunkedScanner:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file_path, target_path)
                 chunk_file_mapping[str(rel_path)] = str(file_path)
+                
+                # Detect language
+                language = self._detect_language(file_path.suffix)
+                if language:
+                    self.detected_languages.add(language)
+                    
             except Exception as e:
                 logger.error(f"Error copying file {file_path}: {e}")
         return chunk_file_mapping
-    
-   
-    
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with fixed configuration"""
+        """Execute Semgrep scan with optimized configuration"""
         max_memory_mb = 2000
         all_files = []
         file_mapping = {}
 
-        # Collect scannable files
+        # Collect scannable files and detect languages
         for root, _, files in os.walk(target_dir):
             if any(exclude in root for exclude in self.config.exclude_patterns):
                 continue
@@ -195,12 +245,18 @@ class ChunkedScanner:
                     file_path.stat().st_size <= self.config.max_file_size_mb * 1024 * 1024):
                     all_files.append(file_path)
                     file_mapping[str(file_path.relative_to(target_dir))] = str(file_path)
+                    
+                    # Detect language
+                    language = self._detect_language(file_path.suffix)
+                    if language:
+                        self.detected_languages.add(language)
 
         # Split into chunks
         chunk_size = 20
         chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
         
         logger.info(f"Split scanning into {len(chunks)} chunks of {chunk_size} files each")
+        logger.info(f"Detected languages: {', '.join(self.detected_languages)}")
 
         all_results = {
             'results': [],
@@ -213,9 +269,18 @@ class ChunkedScanner:
             'stats': {
                 'total_chunks': len(chunks),
                 'completed_chunks': 0,
-                'failed_chunks': 0
+                'failed_chunks': 0,
+                'detected_languages': list(self.detected_languages)
             }
         }
+
+        # Get relevant rulesets based on detected languages
+        selected_rulesets = set()
+        selected_rulesets.update(self.SEMGREP_RULESETS['security'])  # Always include security rules
+        for lang in self.detected_languages:
+            selected_rulesets.update(self.SEMGREP_RULESETS.get(lang, []))
+
+        logger.info(f"Selected rulesets: {', '.join(selected_rulesets)}")
 
         for i, chunk in enumerate(chunks, 1):
             logger.info(f"Scanning chunk {i}/{len(chunks)} with {len(chunk)} files")
@@ -225,7 +290,7 @@ class ChunkedScanner:
             try:
                 chunk_file_mapping = await self._prepare_chunk(chunk, chunk_dir)
                 
-                # Build semgrep command with fixed configuration
+                # Build semgrep command
                 cmd = [
                     "semgrep",
                     "scan",
@@ -235,18 +300,9 @@ class ChunkedScanner:
                     "--severity", "INFO"
                 ]
                 
-                # Add specific rule configurations
-                rule_sets = [
-                    "p/default",
-                    "p/security-audit",
-                    "p/owasp-top-ten",
-                    "p/javascript",
-                    "p/python",
-                    "p/java"
-                ]
-                
-                for rule in rule_sets:
-                    cmd.extend(["--config", rule])
+                # Add selected rulesets
+                for ruleset in selected_rulesets:
+                    cmd.extend(["--config", ruleset])
                 
                 # Add target directory
                 cmd.append(str(chunk_dir))
@@ -321,6 +377,11 @@ class ChunkedScanner:
             all_results['stats']['total_chunks'] * 100
         ) if all_results['stats']['total_chunks'] > 0 else 0
 
+        # Add language-specific stats
+        all_results['stats']['language_summary'] = {
+            lang: self.SEMGREP_RULESETS[lang] for lang in self.detected_languages
+        }
+
         logger.info(
             f"Completed scan: {all_results['stats']['total_findings']} findings, "
             f"{all_results['stats']['files_scanned']} files scanned, "
@@ -361,9 +422,12 @@ class ChunkedScanner:
                     'completion_timestamp': datetime.now().isoformat(),
                     'files_analyzed': len(results['paths']['scanned']),
                     'findings_count': len(results['results']),
+                    'detected_languages': list(self.detected_languages),
                     'performance_metrics': {
                         'total_duration_seconds': scan_duration,
-                        'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
+                        'average_time_per_chunk': scan_duration / results['stats']['total_chunks'],
+                        'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024),
+                        'success_rate': results['stats']['success_rate']
                     }
                 }
             }
@@ -381,10 +445,23 @@ class ChunkedScanner:
         finally:
             await self._cleanup()
 
+def get_severity_weight(severity: str) -> int:
+    """Get numeric weight for severity level for sorting"""
+    weights = {
+        'ERROR': 5,
+        'HIGH': 4,
+        'MEDIUM': 3,
+        'LOW': 2,
+        'INFO': 1,
+        'WARNING': 0
+    }
+    return weights.get(severity.upper(), 0)
+
 async def scan_repository_handler(repo_url: str, installation_token: str, user_id: str) -> Dict:
-    """Handler function for web routes"""
+    """Handler function for web routes with enhanced error handling and validation"""
     logger.info(f"Starting scan request for repository: {repo_url}")
     
+    # Validate inputs
     if not all([repo_url, installation_token, user_id]):
         return {
             'success': False,
@@ -399,6 +476,17 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             }
         }
 
+    # Validate repository URL format
+    if not repo_url.startswith(('http://', 'https://')):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Invalid repository URL format',
+                'code': 'INVALID_URL',
+                'details': {'url': repo_url}
+            }
+        }
+
     try:
         config = ScanConfig()
         start_time = datetime.now()
@@ -408,24 +496,50 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             try:
                 results = await scanner.scan_repository(repo_url, installation_token)
                 
+                # Calculate performance metrics
                 end_time = datetime.now()
                 duration = (end_time - start_time).total_seconds()
                 final_memory = psutil.Process().memory_info().rss / (1024 * 1024)
                 memory_change = final_memory - initial_memory
                 
                 if results['success']:
+                    # Enhance results with additional analysis
+                    if results.get('data', {}).get('results'):
+                        findings = results['data']['results']
+                        
+                        # Sort findings by severity
+                        findings.sort(
+                            key=lambda x: get_severity_weight(x.get('extra', {}).get('severity', '')),
+                            reverse=True
+                        )
+                        
+                        # Add severity counts
+                        severity_counts = {}
+                        for finding in findings:
+                            severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
+                            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                        
+                        results['data']['analysis'] = {
+                            'severity_counts': severity_counts,
+                            'top_files': list(set(f.get('path', '') for f in findings[:10]))
+                        }
+                    
+                    # Add performance metrics
                     results['metadata']['performance_metrics'].update({
                         'total_duration_seconds': duration,
                         'initial_memory_mb': round(initial_memory, 2),
                         'final_memory_mb': round(final_memory, 2),
-                        'memory_change_mb': round(memory_change, 2)
+                        'memory_change_mb': round(memory_change, 2),
+                        'average_time_per_file': duration / len(results['data']['paths']['scanned'])
+                                                if results['data']['paths']['scanned'] else 0
                     })
                     
                     results['metadata']['user_id'] = user_id
                     
                     logger.info(
                         f"Scan completed successfully in {duration:.1f} seconds. "
-                        f"Memory usage: {memory_change:.1f}MB"
+                        f"Memory usage: {memory_change:.1f}MB, "
+                        f"Findings: {len(results['data'].get('results', []))}"
                     )
                     
                 return results
@@ -441,6 +555,10 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
                         'performance': {
                             'duration_seconds': (datetime.now() - start_time).total_seconds(),
                             'memory_usage_mb': round(memory_change, 2)
+                        },
+                        'scan_info': {
+                            'repository_url': repo_url,
+                            'user_id': user_id
                         }
                     }
                 }
@@ -463,15 +581,23 @@ if __name__ == "__main__":
     parser.add_argument("--repo-url", help="Repository URL to scan")
     parser.add_argument("--token", help="GitHub token for authentication")
     parser.add_argument("--user-id", help="User ID for the scan")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     if all([args.repo_url, args.token, args.user_id]):
-        result = asyncio.run(scan_repository_handler(
-            args.repo_url,
-            args.token,
-            args.user_id
-        ))
-        print(json.dumps(result, indent=2))
+        try:
+            result = asyncio.run(scan_repository_handler(
+                args.repo_url,
+                args.token,
+                args.user_id
+            ))
+            print(json.dumps(result, indent=2))
+        except Exception as e:
+            logger.error(f"Scanner failed: {str(e)}")
+            sys.exit(1)
     else:
-        parser.print_help() 
+        parser.print_help()
