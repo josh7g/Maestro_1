@@ -673,7 +673,7 @@ async def scan_repository():
                 installation_token=installation_token,
                 user_id=user_id,
                 db_session=db.session,
-                include_raw_output=True
+        
             )
             
             # Update database with results
