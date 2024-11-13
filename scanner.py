@@ -1,3 +1,4 @@
+
 # scanner.py
 import os
 import subprocess
@@ -86,7 +87,7 @@ class ChunkedScanner:
             'p/xss'
         ]
     }
-    
+
     def __init__(self, config: ScanConfig = ScanConfig(), db_session: Optional[Session] = None):
         self.config = config
         self.db_session = db_session
@@ -188,7 +189,7 @@ class ChunkedScanner:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
-
+ 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute Semgrep scan with optimized configuration"""
         try:
@@ -213,31 +214,15 @@ class ChunkedScanner:
 
             stdout, stderr = await process.communicate()
             
-            output = stdout.decode() if stdout else ""
             stderr_output = stderr.decode() if stderr else ""
-
             if stderr_output and "No findings were found" not in stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
+            output = stdout.decode() if stdout else ""
             if not output.strip():
                 return {}
 
-            results = json.loads(output)
-            
-            return {
-                'findings': results.get('results', []),
-                'errors': results.get('errors', []),
-                'stats': {
-                    'total_findings': len(results.get('results', [])),
-                    'total_errors': len(results.get('errors', [])),
-                    'scan_duration': results.get('time', {}).get('duration_ms', 0) / 1000,
-                    'files_scanned': len(results.get('paths', {}).get('scanned', [])),
-                    'files_ignored': len(results.get('paths', {}).get('ignored', [])),
-                },
-                'severity_counts': self._count_severities(results.get('results', [])),
-                'paths': results.get('paths', {}),
-                'version': results.get('version', 'unknown')
-            }
+            return json.loads(output)
 
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
@@ -267,25 +252,34 @@ class ChunkedScanner:
             
             logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
             
-            processed_results = await self._run_semgrep_scan(repo_path)
+            # Get raw semgrep results
+            semgrep_results = await self._run_semgrep_scan(repo_path)
             scan_duration = (datetime.now() - scan_start_time).total_seconds()
             
+            # Process the results into our desired format
             response = {
                 'success': True,
                 'data': {
-                    'results': processed_results.get('findings', []),
-                    'errors': processed_results.get('errors', []),
-                    'paths': processed_results.get('paths', {}),
-                    'version': processed_results.get('version', 'unknown'),
-                    'stats': processed_results.get('stats', {}),
+                    'results': semgrep_results.get('results', []),  # Direct semgrep findings
+                    'errors': semgrep_results.get('errors', []),
+                    'paths': semgrep_results.get('paths', {}),
+                    'version': semgrep_results.get('version', 'unknown'),
+                    'stats': {
+                        'total_findings': len(semgrep_results.get('results', [])),
+                        'total_errors': len(semgrep_results.get('errors', [])),
+                        'scan_duration': semgrep_results.get('time', {}).get('duration_ms', 0) / 1000,
+                        'files_scanned': len(semgrep_results.get('paths', {}).get('scanned', [])),
+                        'files_ignored': len(semgrep_results.get('paths', {}).get('ignored', [])),
+                    },
+                    'severity_counts': self._count_severities(semgrep_results.get('results', [])),
                     'scan_status': 'completed',
                     'scan_duration_seconds': scan_duration,
                     'metadata': {
                         'repository_size_mb': round(size_mb, 2),
                         'scan_timestamp': scan_start_time.isoformat(),
                         'completion_timestamp': datetime.now().isoformat(),
-                        'files_analyzed': processed_results.get('stats', {}).get('files_scanned', 0),
-                        'findings_count': len(processed_results.get('findings', [])),
+                        'files_analyzed': len(semgrep_results.get('paths', {}).get('scanned', [])),
+                        'findings_count': len(semgrep_results.get('results', [])),
                         'detected_languages': list(self.detected_languages),
                         'performance_metrics': {
                             'total_duration_seconds': scan_duration,
@@ -329,8 +323,7 @@ class ChunkedScanner:
             }
         finally:
             await self._cleanup()
-
-# Handler function (moved outside the class)
+   
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
@@ -378,9 +371,9 @@ if __name__ == "__main__":
     import sys
     
     parser = argparse.ArgumentParser(description="Enhanced Semgrep Security Scanner")
-    parser.add_argument("--repo-url", help="Repository URL to scan")
-    parser.add_argument("--token", help="GitHub token for authentication")
-    parser.add_argument("--user-id", help="User ID for the scan")
+    parser.add_argument("--repo-url", required=True, help="Repository URL to scan")
+    parser.add_argument("--token", required=True, help="GitHub token for authentication")
+    parser.add_argument("--user-id", required=True, help="User ID for the scan")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
@@ -388,16 +381,13 @@ if __name__ == "__main__":
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    if all([args.repo_url, args.token, args.user_id]):
-        try:
-            result = asyncio.run(scan_repository_handler(
-                args.repo_url,
-                args.token,
-                args.user_id
-            ))
-            print(json.dumps(result, indent=2))
-        except Exception as e:
-            logger.error(f"Scanner failed: {str(e)}")
-            sys.exit(1)
-    else:
-        parser.print_help()
+    try:
+        result = asyncio.run(scan_repository_handler(
+            args.repo_url,
+            args.token,
+            args.user_id
+        ))
+        print(json.dumps(result, indent=2))
+    except Exception as e:
+        logger.error(f"Scanner failed: {str(e)}")
+        sys.exit(1)
