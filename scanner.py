@@ -7,17 +7,16 @@ import tempfile
 import shutil
 import asyncio
 import git
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%b %d %I:%M:%S %p'
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,6 @@ class ScanConfig:
     semgrep_rules: List[str] = field(default_factory=lambda: [
         "p/default",
         "p/security-audit",
-        "p/ci",
         "p/owasp-top-ten",
         "p/javascript",
         "p/python",
@@ -66,7 +64,7 @@ class GitProgress(git.RemoteProgress):
             logger.info(f"Git progress: {progress:.1f}%")
 
 class ChunkedScanner:
-    """Enhanced scanner class for processing repositories"""
+    """Scanner class for processing repositories"""
     SCANNABLE_EXTENSIONS = {
         # Web development
         '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
@@ -92,19 +90,6 @@ class ChunkedScanner:
         self.config = config
         self.temp_dir = None
         self.repo_dir = None
-        self._setup_logging()
-
-    def _setup_logging(self):
-        """Setup detailed logging for the scanner"""
-        self.logger = logging.getLogger(__name__)
-        log_handler = logging.StreamHandler()
-        log_formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        log_handler.setFormatter(log_formatter)
-        self.logger.addHandler(log_handler)
-        self.logger.setLevel(logging.INFO)
 
     async def __aenter__(self):
         await self._setup()
@@ -116,16 +101,16 @@ class ChunkedScanner:
     async def _setup(self):
         """Initialize scanner resources"""
         self.temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
-        self.logger.info(f"Created temporary directory: {self.temp_dir}")
+        logger.info(f"Created temporary directory: {self.temp_dir}")
 
     async def _cleanup(self):
         """Cleanup scanner resources"""
         try:
             if self.temp_dir and self.temp_dir.exists():
                 shutil.rmtree(self.temp_dir)
-                self.logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
+            logger.error(f"Error during cleanup: {e}")
 
     async def _get_directory_size(self, directory: Path) -> int:
         """Calculate directory size excluding ignored paths"""
@@ -153,14 +138,12 @@ class ChunkedScanner:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             auth_url = repo_url.replace('https://', f'https://x-access-token:{token}@')
 
-            self.logger.info(f"Cloning repository to {self.repo_dir}")
+            logger.info(f"Cloning repository to {self.repo_dir}")
             
-            # Configure git options for efficient cloning
             git_options = [
                 '--depth=1',
                 '--single-branch',
-                '--no-tags',
-                '--recursive'
+                '--no-tags'
             ]
             
             repo = git.Repo.clone_from(
@@ -179,7 +162,7 @@ class ChunkedScanner:
                     f"limit of {self.config.max_total_size_gb} GB"
                 )
 
-            self.logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
+            logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
             return self.repo_dir
 
         except Exception as e:
@@ -198,11 +181,11 @@ class ChunkedScanner:
                 shutil.copy2(file_path, target_path)
                 chunk_file_mapping[str(rel_path)] = str(file_path)
             except Exception as e:
-                self.logger.error(f"Error copying file {file_path}: {e}")
+                logger.error(f"Error copying file {file_path}: {e}")
         return chunk_file_mapping
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with comprehensive configuration"""
+        """Execute Semgrep scan with corrected configuration"""
         max_memory_mb = 2000
         all_files = []
         file_mapping = {}
@@ -222,7 +205,7 @@ class ChunkedScanner:
         chunk_size = 20
         chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
         
-        self.logger.info(f"Split scanning into {len(chunks)} chunks of {chunk_size} files each")
+        logger.info(f"Split scanning into {len(chunks)} chunks of {chunk_size} files each")
 
         all_results = {
             'results': [],
@@ -240,32 +223,30 @@ class ChunkedScanner:
         }
 
         for i, chunk in enumerate(chunks, 1):
-            self.logger.info(f"Scanning chunk {i}/{len(chunks)} with {len(chunk)} files")
+            logger.info(f"Scanning chunk {i}/{len(chunks)} with {len(chunk)} files")
             chunk_dir = target_dir / f"chunk_{i}"
             chunk_dir.mkdir(exist_ok=True)
 
             try:
                 chunk_file_mapping = await self._prepare_chunk(chunk, chunk_dir)
                 
-                # Build semgrep command with all configurations
-                cmd = ["semgrep", "scan"]
-                
-                # Add all rule configurations
-                for rule in self.config.semgrep_rules:
-                    cmd.extend(["--config", rule])
-                
-                # Add other options
-                cmd.extend([
+                # Build semgrep command
+                cmd = [
+                    "semgrep",
+                    "scan",
                     "--json",
                     "--max-memory", str(max_memory_mb),
                     "--timeout", "300",
                     "--jobs", "1",
-                    "--severity", "INFO",
-                    "--enable-nosem",
-                    "--enable-metrics",
-                    "--verbose",
-                    str(chunk_dir)
-                ])
+                    "--severity", "INFO"
+                ]
+                
+                # Add ruleset configurations
+                for rule in self.config.semgrep_rules:
+                    cmd.extend(["--config", rule])
+                
+                # Add target directory
+                cmd.append(str(chunk_dir))
 
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -283,39 +264,43 @@ class ChunkedScanner:
                     stdout_str = stdout.decode() if stdout else ""
                     stderr_str = stderr.decode() if stderr else ""
                     
-                    if stderr_str:
-                        self.logger.warning(f"Semgrep stderr for chunk {i}: {stderr_str}")
+                    if stderr_str and not "No findings were found" in stderr_str:
+                        logger.warning(f"Semgrep stderr for chunk {i}: {stderr_str}")
 
                     if stdout_str.strip():
-                        chunk_results = json.loads(stdout_str)
-                        all_results['paths']['scanned'].update(chunk_file_mapping.keys())
+                        try:
+                            chunk_results = json.loads(stdout_str)
+                            all_results['paths']['scanned'].update(chunk_file_mapping.keys())
 
-                        # Process findings
-                        for finding in chunk_results.get('results', []):
-                            if 'path' in finding:
-                                rel_path = finding['path']
-                                finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
-                                finding['chunk_info'] = {
-                                    'chunk_number': i,
-                                    'total_chunks': len(chunks)
-                                }
-                            all_results['results'].append(finding)
+                            # Process findings
+                            for finding in chunk_results.get('results', []):
+                                if 'path' in finding:
+                                    rel_path = finding['path']
+                                    finding['path'] = chunk_file_mapping.get(rel_path, rel_path)
+                                    finding['chunk_info'] = {
+                                        'chunk_number': i,
+                                        'total_chunks': len(chunks)
+                                    }
+                                all_results['results'].append(finding)
 
-                        # Add any errors
-                        chunk_errors = chunk_results.get('errors', [])
-                        for error in chunk_errors:
-                            error['chunk_number'] = i
-                        all_results['errors'].extend(chunk_errors)
+                            # Add any errors
+                            chunk_errors = chunk_results.get('errors', [])
+                            for error in chunk_errors:
+                                error['chunk_number'] = i
+                            all_results['errors'].extend(chunk_errors)
 
-                        self.logger.info(
-                            f"Successfully scanned chunk {i} with "
-                            f"{len(chunk_results.get('results', []))} findings and "
-                            f"{len(chunk_errors)} errors"
-                        )
-                        all_results['stats']['completed_chunks'] += 1
+                            logger.info(
+                                f"Successfully scanned chunk {i} with "
+                                f"{len(chunk_results.get('results', []))} findings"
+                            )
+                            all_results['stats']['completed_chunks'] += 1
+                            
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse semgrep output for chunk {i}: {e}")
+                            all_results['stats']['failed_chunks'] += 1
 
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout scanning chunk {i}")
+                    logger.warning(f"Timeout scanning chunk {i}")
                     all_results['errors'].append({
                         'code': 'timeout',
                         'message': f'Chunk {i} scanning timed out after 300 seconds',
@@ -325,7 +310,7 @@ class ChunkedScanner:
                     continue
 
             except Exception as e:
-                self.logger.error(f"Error processing chunk {i}: {str(e)}")
+                logger.error(f"Error processing chunk {i}: {str(e)}")
                 all_results['errors'].append({
                     'code': 'chunk_error',
                     'message': f'Error processing chunk {i}: {str(e)}',
@@ -338,7 +323,7 @@ class ChunkedScanner:
                 try:
                     shutil.rmtree(chunk_dir)
                 except Exception as e:
-                    self.logger.error(f"Error cleaning up chunk directory: {str(e)}")
+                    logger.error(f"Error cleaning up chunk directory: {str(e)}")
 
         # Convert sets to lists for JSON serialization
         all_results['paths']['scanned'] = list(all_results['paths']['scanned'])
@@ -351,9 +336,9 @@ class ChunkedScanner:
         all_results['stats']['success_rate'] = (
             all_results['stats']['completed_chunks'] / 
             all_results['stats']['total_chunks'] * 100
-        )
+        ) if all_results['stats']['total_chunks'] > 0 else 0
 
-        self.logger.info(
+        logger.info(
             f"Completed scan: {all_results['stats']['total_findings']} findings, "
             f"{all_results['stats']['files_scanned']} files scanned, "
             f"{all_results['stats']['total_errors']} errors, "
@@ -363,7 +348,7 @@ class ChunkedScanner:
         return all_results
 
     async def scan_repository(self, repo_url: str, token: str) -> Dict:
-        """Main method to scan a repository with comprehensive error handling"""
+        """Main method to scan a repository"""
         scan_start_time = datetime.now()
         
         try:
@@ -371,7 +356,7 @@ class ChunkedScanner:
             repo_size = await self._get_directory_size(repo_path)
             size_mb = repo_size / (1024 * 1024)
             
-            self.logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
+            logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
             
             results = await self._run_semgrep_scan(repo_path)
             
@@ -394,16 +379,15 @@ class ChunkedScanner:
                     'completion_timestamp': datetime.now().isoformat(),
                     'files_analyzed': len(results['paths']['scanned']),
                     'findings_count': len(results['results']),
-                    'success_rate': results['stats']['success_rate'],
                     'performance_metrics': {
-                        'average_time_per_chunk': scan_duration / results['stats']['total_chunks'],
+                        'total_duration_seconds': scan_duration,
                         'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
                     }
                 }
             }
             
         except Exception as e:
-            self.logger.error(f"Scan failed: {str(e)}")
+            logger.error(f"Scan failed: {str(e)}")
             return {
                 'success': False,
                 'error': {
@@ -417,8 +401,8 @@ class ChunkedScanner:
 
 
 async def scan_repository_handler(repo_url: str, installation_token: str, user_id: str) -> Dict:
-    """Handler function for web routes with enhanced validation and error handling"""
-    logger.info(f"Starting scan for repository: {repo_url}")
+    """Handler function for web routes"""
+    logger.info(f"Starting scan request for repository: {repo_url}")
     
     if not all([repo_url, installation_token, user_id]):
         return {
@@ -434,18 +418,7 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             }
         }
 
-    # Validate repository URL format
-    if not repo_url.startswith(('http://', 'https://')):
-        return {
-            'success': False,
-            'error': {
-                'message': 'Invalid repository URL format',
-                'code': 'INVALID_URL_FORMAT'
-            }
-        }
-
     try:
-        # Create scanner configuration with optimized settings
         config = ScanConfig(
             max_file_size_mb=50,
             max_total_size_gb=2,
@@ -457,7 +430,6 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             semgrep_rules=[
                 "p/default",
                 "p/security-audit",
-                "p/ci",
                 "p/owasp-top-ten",
                 "p/javascript",
                 "p/python",
@@ -465,9 +437,9 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             ]
         )
         
-        # Initialize system metrics
-        initial_memory = psutil.Process().memory_info().rss / (1024 * 1024)
+        # Track performance metrics
         start_time = datetime.now()
+        initial_memory = psutil.Process().memory_info().rss / (1024 * 1024)
         
         async with ChunkedScanner(config) as scanner:
             try:
@@ -479,15 +451,16 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
                 final_memory = psutil.Process().memory_info().rss / (1024 * 1024)
                 memory_change = final_memory - initial_memory
                 
-                # Add performance metrics to results
                 if results['success']:
-                    results['metadata']['performance'] = {
-                        'scan_duration_seconds': duration,
+                    # Add performance metrics
+                    results['metadata']['performance_metrics'].update({
+                        'total_duration_seconds': duration,
                         'initial_memory_mb': round(initial_memory, 2),
                         'final_memory_mb': round(final_memory, 2),
                         'memory_change_mb': round(memory_change, 2)
-                    }
+                    })
                     
+                    # Add user information
                     results['metadata']['user_id'] = user_id
                     results['metadata']['scan_timestamp'] = start_time.isoformat()
                     
@@ -495,9 +468,7 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
                         f"Scan completed successfully in {duration:.1f} seconds. "
                         f"Memory usage: {memory_change:.1f}MB"
                     )
-                else:
-                    logger.error(f"Scan failed: {results.get('error', {}).get('message')}")
-                
+                    
                 return results
                 
             except Exception as e:
@@ -526,83 +497,77 @@ async def scan_repository_handler(repo_url: str, installation_token: str, user_i
             }
         }
 
-
-# Optional: Add utility functions for testing and debugging
-def test_scanner_config(config: ScanConfig) -> Dict:
-    """Test scanner configuration and validate settings"""
-    issues = []
-    
-    # Check memory limits
-    system_memory = psutil.virtual_memory().total / (1024 ** 3)  # GB
-    if config.max_total_size_gb > system_memory * 0.8:
-        issues.append(f"max_total_size_gb ({config.max_total_size_gb}GB) may be too high for system memory ({system_memory:.1f}GB)")
-    
-    # Check concurrent processes
-    cpu_count = psutil.cpu_count()
-    if config.concurrent_processes > cpu_count:
-        issues.append(f"concurrent_processes ({config.concurrent_processes}) exceeds CPU count ({cpu_count})")
-    
-    # Validate semgrep rules
+def validate_semgrep_installation() -> Dict:
+    """Validate semgrep installation and available rules"""
     try:
-        subprocess.run(["semgrep", "--version"], capture_output=True, check=True)
-        for rule in config.semgrep_rules:
-            subprocess.run(["semgrep", "--validate", f"--config={rule}"], capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        issues.append(f"Semgrep rule validation failed: {str(e)}")
-    except FileNotFoundError:
-        issues.append("Semgrep not found in system PATH")
-    
-    return {
-        'valid': len(issues) == 0,
-        'issues': issues,
-        'config': {
-            'max_file_size_mb': config.max_file_size_mb,
-            'max_total_size_gb': config.max_total_size_gb,
-            'max_memory_percent': config.max_memory_percent,
-            'timeout_seconds': config.timeout_seconds,
-            'concurrent_processes': config.concurrent_processes,
-            'rules_count': len(config.semgrep_rules)
-        }
-    }
-
-def get_scanner_status() -> Dict:
-    """Get current scanner status and system resources"""
-    return {
-        'timestamp': datetime.now().isoformat(),
-        'system_resources': {
-            'cpu_percent': psutil.cpu_percent(interval=1),
-            'memory_percent': psutil.virtual_memory().percent,
-            'memory_available_gb': psutil.virtual_memory().available / (1024 ** 3),
-            'disk_usage_percent': psutil.disk_usage('/').percent
-        },
-        'semgrep_version': subprocess.run(
+        # Check semgrep version
+        version_result = subprocess.run(
             ["semgrep", "--version"],
             capture_output=True,
             text=True
-        ).stdout.strip(),
-        'scanner_ready': True
-    }
+        )
+        
+        if version_result.returncode != 0:
+            return {
+                'installed': False,
+                'error': 'Semgrep not properly installed',
+                'details': version_result.stderr
+            }
+            
+        # Test basic functionality
+        test_result = subprocess.run(
+            ["semgrep", "--test", "--config=p/default"],
+            capture_output=True,
+            text=True
+        )
+        
+        return {
+            'installed': True,
+            'version': version_result.stdout.strip(),
+            'rules_test': test_result.returncode == 0,
+            'available_rules': [
+                "p/default",
+                "p/security-audit",
+                "p/owasp-top-ten",
+                "p/javascript",
+                "p/python",
+                "p/java"
+            ]
+        }
+        
+    except FileNotFoundError:
+        return {
+            'installed': False,
+            'error': 'Semgrep not found in system PATH'
+        }
+    except Exception as e:
+        return {
+            'installed': False,
+            'error': str(e)
+        }
 
 if __name__ == "__main__":
-    # Example usage and testing
     import argparse
     
-    parser = argparse.ArgumentParser(description="Semgrep Scanner CLI")
+    parser = argparse.ArgumentParser(description="Semgrep Security Scanner")
     parser.add_argument("--repo-url", help="Repository URL to scan")
     parser.add_argument("--token", help="GitHub token for authentication")
     parser.add_argument("--user-id", help="User ID for the scan")
-    parser.add_argument("--test-config", action="store_true", help="Test scanner configuration")
-    parser.add_argument("--status", action="store_true", help="Get scanner status")
+    parser.add_argument("--validate", action="store_true", help="Validate semgrep installation")
     
     args = parser.parse_args()
     
-    if args.test_config:
-        print(json.dumps(test_scanner_config(ScanConfig()), indent=2))
-    elif args.status:
-        print(json.dumps(get_scanner_status(), indent=2))
-    elif all([args.repo_url, args.token, args.user_id]):
-        import asyncio
-        result = asyncio.run(scan_repository_handler(args.repo_url, args.token, args.user_id))
+    if args.validate:
+        status = validate_semgrep_installation()
+        print(json.dumps(status, indent=2))
+        exit(0 if status['installed'] else 1)
+        
+    if all([args.repo_url, args.token, args.user_id]):
+        result = asyncio.run(scan_repository_handler(
+            args.repo_url,
+            args.token,
+            args.user_id
+        ))
         print(json.dumps(result, indent=2))
     else:
         parser.print_help()
