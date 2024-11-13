@@ -8,7 +8,7 @@ import tempfile
 import shutil
 import asyncio
 import git
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +32,6 @@ class ScanConfig:
     timeout_seconds: int = 3600
     max_retries: int = 3
     concurrent_processes: int = 1
-    include_raw_output: bool = True  # New option to include raw semgrep output
     exclude_patterns: List[str] = field(default_factory=lambda: [
         'node_modules',
         'vendor',
@@ -51,7 +50,7 @@ class ScanConfig:
     ])
 
 class ChunkedScanner:
-    """Enhanced scanner combining async performance with comprehensive results"""
+    """Scanner implementation for repository analysis"""
     
     SCANNABLE_EXTENSIONS = {
         # Web development
@@ -94,7 +93,6 @@ class ChunkedScanner:
         self.temp_dir = None
         self.repo_dir = None
         self.detected_languages = set()
-        self.raw_outputs = []  # Store raw outputs from each chunk
 
     async def __aenter__(self):
         await self._setup()
@@ -131,24 +129,81 @@ class ChunkedScanner:
         }
         return extension_map.get(file_extension.lower())
 
-    async def _run_semgrep_scan(self, target_dir: Path) -> Tuple[Dict, Optional[str]]:
-        """Execute Semgrep scan with optimized configuration and return both processed and raw results"""
+    async def _get_directory_size(self, directory: Path) -> int:
+        """Calculate directory size excluding ignored paths"""
+        total_size = 0
         try:
-            # Build command with all selected rulesets
+            for dirpath, dirnames, filenames in os.walk(directory):
+                dirnames[:] = [d for d in dirnames if not any(
+                    exclude in d for exclude in self.config.exclude_patterns
+                )]
+                
+                for filename in filenames:
+                    if any(exclude in filename for exclude in self.config.exclude_patterns):
+                        continue
+                        
+                    file_path = Path(dirpath) / filename
+                    try:
+                        total_size += file_path.stat().st_size
+                    except (OSError, FileNotFoundError):
+                        continue
+        except Exception as e:
+            logger.error(f"Error calculating directory size: {str(e)}")
+            
+        return total_size
+
+    async def _clone_repository(self, repo_url: str, token: str) -> Path:
+        """Clone repository with authentication and size validation"""
+        try:
+            self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            auth_url = repo_url.replace('https://', f'https://x-access-token:{token}@')
+
+            logger.info(f"Cloning repository to {self.repo_dir}")
+            
+            git_options = [
+                '--depth=1',
+                '--single-branch',
+                '--no-tags'
+            ]
+            
+            repo = git.Repo.clone_from(
+                auth_url,
+                self.repo_dir,
+                multi_options=git_options
+            )
+
+            repo_size = await self._get_directory_size(self.repo_dir)
+            size_gb = repo_size / (1024 ** 3)
+            
+            if size_gb > self.config.max_total_size_gb:
+                raise ValueError(
+                    f"Repository size ({size_gb:.2f} GB) exceeds "
+                    f"limit of {self.config.max_total_size_gb} GB"
+                )
+
+            logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
+            return self.repo_dir
+
+        except Exception as e:
+            if self.repo_dir and self.repo_dir.exists():
+                shutil.rmtree(self.repo_dir)
+            raise RuntimeError(f"Repository clone failed: {str(e)}") from e
+
+    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+        """Execute Semgrep scan with optimized configuration"""
+        try:
             cmd = [
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "auto",  # Use auto for comprehensive scanning
+                "--config", "auto",
                 "--max-memory", "2000",
                 "--timeout", "300",
                 "--severity", "INFO"
             ]
             
-            # Add target directory
             cmd.append(str(target_dir))
 
-            # Run semgrep
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -158,21 +213,18 @@ class ChunkedScanner:
 
             stdout, stderr = await process.communicate()
             
-            # Store raw output
-            raw_output = stdout.decode() if stdout else ""
+            output = stdout.decode() if stdout else ""
             stderr_output = stderr.decode() if stderr else ""
 
             if stderr_output and "No findings were found" not in stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
-            if not raw_output.strip():
-                return {}, None
+            if not output.strip():
+                return {}
 
-            # Parse and process results
-            results = json.loads(raw_output)
+            results = json.loads(output)
             
-            # Enhanced results processing
-            processed_results = {
+            return {
                 'findings': results.get('results', []),
                 'errors': results.get('errors', []),
                 'stats': {
@@ -187,11 +239,9 @@ class ChunkedScanner:
                 'version': results.get('version', 'unknown')
             }
 
-            return processed_results, raw_output if self.config.include_raw_output else None
-
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
-            return {}, None
+            return {}
 
     def _count_severities(self, findings: List[Dict]) -> Dict[str, int]:
         """Count findings by severity"""
@@ -207,29 +257,23 @@ class ChunkedScanner:
         token: str,
         user_id: Optional[str] = None
     ) -> Dict[str, Union[bool, Dict]]:
-        """
-        Enhanced repository scanning with both processed and raw results
-        """
+        """Execute repository scanning and results processing"""
         scan_start_time = datetime.now()
         
         try:
-            # Clone repository
             repo_path = await self._clone_repository(repo_url, token)
             repo_size = await self._get_directory_size(repo_path)
             size_mb = repo_size / (1024 * 1024)
             
             logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
             
-            # Run the scan
-            processed_results, raw_output = await self._run_semgrep_scan(repo_path)
-            
+            processed_results = await self._run_semgrep_scan(repo_path)
             scan_duration = (datetime.now() - scan_start_time).total_seconds()
             
-            # Prepare comprehensive response
             response = {
                 'success': True,
                 'data': {
-                    'processed_results': processed_results,
+                    'results': processed_results,
                     'scan_status': 'completed',
                     'scan_duration_seconds': scan_duration,
                     'metadata': {
@@ -246,22 +290,16 @@ class ChunkedScanner:
                     }
                 }
             }
-            
-            # Include raw output if requested
-            if self.config.include_raw_output and raw_output:
-                response['data']['raw_semgrep_output'] = raw_output
 
-            # Update database if session provided
             if self.db_session is not None and user_id is not None:
                 try:
-                    from models import AnalysisResult  # Import here to avoid circular dependency
+                    from models import AnalysisResult
                     
                     analysis = AnalysisResult(
                         repository_name=repo_url.split('github.com/')[-1].replace('.git', ''),
                         user_id=user_id,
                         status='completed',
-                        results=processed_results,
-                        raw_results=raw_output if self.config.include_raw_output else None
+                        results=processed_results
                     )
                     
                     self.db_session.add(analysis)
@@ -292,13 +330,11 @@ async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
     user_id: str,
-    db_session: Optional[Session] = None,
-    include_raw_output: bool = True
+    db_session: Optional[Session] = None
 ) -> Dict:
-    """Enhanced handler function for web routes"""
+    """Handler function for web routes"""
     logger.info(f"Starting scan request for repository: {repo_url}")
     
-    # Validate inputs
     if not all([repo_url, installation_token, user_id]):
         return {
             'success': False,
@@ -309,9 +345,8 @@ async def scan_repository_handler(
         }
 
     try:
-        config = ScanConfig(include_raw_output=include_raw_output)
+        config = ScanConfig()
         
-        # Changed from EnhancedScanner to ChunkedScanner here
         async with ChunkedScanner(config, db_session) as scanner:
             results = await scanner.scan_repository(
                 repo_url,
@@ -333,15 +368,14 @@ async def scan_repository_handler(
             }
         }
 
-# Example usage
 if __name__ == "__main__":
     import argparse
+    import sys
     
     parser = argparse.ArgumentParser(description="Enhanced Semgrep Security Scanner")
     parser.add_argument("--repo-url", help="Repository URL to scan")
     parser.add_argument("--token", help="GitHub token for authentication")
     parser.add_argument("--user-id", help="User ID for the scan")
-    parser.add_argument("--raw", action="store_true", help="Include raw Semgrep output")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
@@ -354,8 +388,7 @@ if __name__ == "__main__":
             result = asyncio.run(scan_repository_handler(
                 args.repo_url,
                 args.token,
-                args.user_id,
-                include_raw_output=args.raw
+                args.user_id
             ))
             print(json.dumps(result, indent=2))
         except Exception as e:
