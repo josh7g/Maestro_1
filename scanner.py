@@ -273,7 +273,11 @@ class ChunkedScanner:
             response = {
                 'success': True,
                 'data': {
-                    'results': processed_results,
+                    'results': processed_results.get('findings', []),
+                    'errors': processed_results.get('errors', []),
+                    'paths': processed_results.get('paths', {}),
+                    'version': processed_results.get('version', 'unknown'),
+                    'stats': processed_results.get('stats', {}),
                     'scan_status': 'completed',
                     'scan_duration_seconds': scan_duration,
                     'metadata': {
@@ -299,7 +303,7 @@ class ChunkedScanner:
                         repository_name=repo_url.split('github.com/')[-1].replace('.git', ''),
                         user_id=user_id,
                         status='completed',
-                        results=processed_results
+                        results=response['data']
                     )
                     
                     self.db_session.add(analysis)
@@ -326,6 +330,7 @@ class ChunkedScanner:
         finally:
             await self._cleanup()
 
+# Handler function (moved outside the class)
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
