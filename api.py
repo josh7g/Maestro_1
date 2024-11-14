@@ -5,6 +5,8 @@ from collections import defaultdict
 import os
 import logging
 from pathlib import Path
+import tempfile
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,6 +14,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
 api = Blueprint('api', __name__, url_prefix='/api/v1')
 
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
@@ -147,17 +150,15 @@ def get_top_vulnerabilities(user_id):
             'success': False,
             'error': {'message': str(e)}
         }), 500
+
 @api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
 def get_file_content(owner: str, repo: str, user_id: str, filename: str):
     try:
         repository = f"{owner}/{repo}"
         
-        # Use same temp directory pattern as scanner
-        repo_pattern = f"repo_{datetime.now().strftime('%Y%m%d')}"
-        base_dir = Path(tempfile.gettempdir())
-        
         # Find the most recent repo directory
-        repo_dirs = list(base_dir.glob(f"scanner_*/repo_*"))
+        base_dir = Path(tempfile.gettempdir())
+        repo_dirs = list(base_dir.glob("scanner_*/repo_*"))
         if not repo_dirs:
             return jsonify({
                 'success': False,
@@ -165,7 +166,6 @@ def get_file_content(owner: str, repo: str, user_id: str, filename: str):
             }), 404
             
         repo_dir = sorted(repo_dirs, key=lambda x: x.stat().st_mtime)[-1]
-        
         file_path = repo_dir / filename
         
         # Security check
