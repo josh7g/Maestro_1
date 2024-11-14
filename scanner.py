@@ -23,174 +23,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
-    """Enhanced configuration for multi-language repository scanning"""
+    """Configuration for repository scanning"""
     max_file_size_mb: int = 100
     max_total_size_gb: int = 5
     max_memory_percent: int = 90
-    chunk_size_mb: int = 1000
     timeout_seconds: int = 3600
     max_retries: int = 3
     concurrent_processes: int = 1
     exclude_patterns: List[str] = field(default_factory=lambda: [
-        # Package Management
-        'node_modules',
-        'vendor',
-        'packages',
-        'pip-cache',
-        'gradle-cache',
-        'maven-cache',
-        
-        # Build Outputs
-        'build',
-        'dist',
-        'target',
-        'out',
-        'output',
-        'bin',
-        'obj',
-        
-        # Virtual Environments
-        'venv',
-        'env',
-        '.virtualenv',
-        '.venv',
-        'virtualenv',
-        
-        # IDE and Editor
         '.git',
-        '.idea',
-        '.vscode',
-        '.vs',
-        '.eclipse',
-        '.settings',
-        
-        # Cache and Temp
+        'node_modules',
+        'venv',
+        '.env',
         '__pycache__',
-        '.pytest_cache',
-        '.mypy_cache',
-        '.ruff_cache',
-        'coverage',
-        '.coverage',
-        '.cache',
-        'tmp',
-        'temp',
-        
-        # Compiled and Minified
-        '*.min.js',
-        '*.min.css',
-        '*.bundle.js',
-        '*.bundle.css',
-        '*.map',
-        '*.pyc',
-        '*.pyo',
-        '*.pyd',
-        '*.class',
-        '*.jar',
-        '*.war',
-        
-        # Framework Specific
-        '.next',
-        '.nuxt',
-        '.gatsby',
-        'migrations',
-        'assets/generated',
-        'public/static',
-        
-        # Documentation
-        'docs/_build',
-        'site-packages',
-        'htmlcov',
-        
-        # Large Data
-        '*.csv',
-        '*.json',
-        '*.sql',
-        '*.db',
-        '*.sqlite3',
-        '*.bak',
-        
-        # Mobile Specific
-        'Pods',
-        'Carthage',
-        'build-ios',
-        'build-android',
-        
-        # Container and Infrastructure
-        '.terraform',
-        'terraform.tfstate*',
-        'bower_components'
+        '.pytest_cache'
     ])
 
-class ChunkedScanner:
-    """Enhanced scanner implementation for multi-language analysis"""
+class SecurityScanner:
+    """Enhanced security scanner implementation"""
     
-    SCANNABLE_EXTENSIONS = {
-        # Web Technologies
-        '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
-        '.html', '.htm', '.css', '.scss', '.sass', '.less',
-        
-        # Backend Languages
-        '.py', '.rb', '.php', '.java', '.go', '.cs', '.cpp',
-        '.c', '.h', '.hpp', '.scala', '.kt', '.rs',
-        
-        # Mobile Development
-        '.swift', '.m', '.mm', '.kotlin', '.dart',
-        
-        # Configuration and Data
-        '.json', '.yml', '.yaml', '.xml', '.conf', '.ini',
-        '.env', '.properties', '.toml', '.lock',
-        
-        # Infrastructure
-        '.tf', '.hcl', '.dockerfile', '.docker',
-        
-        # Scripts and Templates
-        '.sh', '.bash', '.ps1', '.ejs', '.hbs', '.pug',
-        '.jsp', '.asp', '.aspx', '.cshtml', '.razor',
-        
-        # Documentation and Others
-        '.md', '.txt', '.sql', '.graphql', '.proto'
-    }
-
-    SEMGREP_RULESETS = {
-        'javascript': [
-            'p/javascript',
-            'p/nodejs',
-            'p/react',
-            'p/typescript'
-        ],
-        'python': [
-            'p/python',
-            'p/flask',
-            'p/django'
-        ],
-        'java': [
-            'p/java'
-        ],
-        'security': [
-            'p/security-audit',
-            'p/owasp-top-ten',
-            'p/jwt',
-            'p/secrets',
-            'p/sql-injection',
-            'p/xss'
-        ],
-        'quality': [
-            'p/ci'
-        ]
-    }
-
     def __init__(self, config: ScanConfig = ScanConfig(), db_session: Optional[Session] = None):
         self.config = config
         self.db_session = db_session
         self.temp_dir = None
         self.repo_dir = None
-        self.detected_languages = set()
         self.scan_stats = {
             'start_time': None,
             'end_time': None,
             'total_files': 0,
             'files_processed': 0,
             'findings_count': 0,
+            'excluded_files': 0,
+            'skipped_files': 0,
             'languages_detected': set()
         }
 
@@ -217,119 +81,18 @@ class ChunkedScanner:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
-    def _detect_language(self, file_path: str) -> Optional[str]:
-        """Enhanced language detection from file path"""
-        extension = os.path.splitext(file_path)[1].lower()
-        extension_map = {
-            # Web Technologies
-            '.js': 'javascript',
-            '.jsx': 'javascript',
-            '.ts': 'typescript',
-            '.tsx': 'typescript',
-            '.vue': 'vue',
-            '.svelte': 'javascript',
-            
-            # Backend Languages
-            '.py': 'python',
-            '.java': 'java',
-            '.cs': 'csharp',
-            '.go': 'go',
-            '.rb': 'ruby',
-            '.php': 'php',
-            '.scala': 'scala',
-            '.kt': 'kotlin',
-            '.rs': 'rust',
-            
-            # Mobile
-            '.swift': 'swift',
-            '.m': 'objective-c',
-            '.mm': 'objective-c',
-            '.dart': 'dart',
-            
-            # Infrastructure
-            '.tf': 'terraform',
-            '.yml': 'yaml',
-            '.yaml': 'yaml',
-            '.docker': 'docker',
-            '.dockerfile': 'docker',
-            
-            # Templates and Markup
-            '.html': 'html',
-            '.htm': 'html',
-            '.xml': 'xml',
-            '.xhtml': 'html',
-            '.jsp': 'java',
-            '.asp': 'asp',
-            '.aspx': 'asp',
-            
-            # Data
-            '.sql': 'sql',
-            '.graphql': 'graphql',
-            '.gql': 'graphql',
-            
-            # Configuration
-            '.json': 'json',
-            '.toml': 'toml',
-            '.ini': 'ini',
-            '.conf': 'conf',
-            
-            # CSS and Styling
-            '.css': 'css',
-            '.scss': 'scss',
-            '.sass': 'sass',
-            '.less': 'less',
-            
-            # Shell and Scripts
-            '.sh': 'shell',
-            '.bash': 'shell',
-            '.zsh': 'shell',
-            '.ps1': 'powershell'
-        }
-        return extension_map.get(extension)
-
-    async def _get_directory_size(self, directory: Path) -> int:
-        """Calculate directory size excluding ignored paths"""
-        total_size = 0
-        try:
-            for dirpath, dirnames, filenames in os.walk(directory):
-                dirnames[:] = [d for d in dirnames if not any(
-                    exclude in d for exclude in self.config.exclude_patterns
-                )]
-                
-                for filename in filenames:
-                    if any(exclude in filename for exclude in self.config.exclude_patterns):
-                        continue
-                        
-                    file_path = Path(dirpath) / filename
-                    try:
-                        total_size += file_path.stat().st_size
-                        # Detect language for the file
-                        lang = self._detect_language(str(file_path))
-                        if lang:
-                            self.detected_languages.add(lang)
-                            self.scan_stats['languages_detected'].add(lang)
-                        self.scan_stats['total_files'] += 1
-                    except (OSError, FileNotFoundError):
-                        continue
-        except Exception as e:
-            logger.error(f"Error calculating directory size: {str(e)}")
-            
-        return total_size
-
     async def _clone_repository(self, repo_url: str, token: str) -> Path:
-        """Clone repository with authentication and size validation"""
+        """Clone repository with enhanced error handling"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             auth_url = repo_url.replace('https://', f'https://x-access-token:{token}@')
 
             logger.info(f"Cloning repository to {self.repo_dir}")
             
+            # Basic git options for complete repository access
             git_options = [
-                '--depth=1',
                 '--single-branch',
-                '--no-tags',
-                '--filter=blob:none',  # Optimize clone size
-                '--sparse'  # Enable sparse checkout
+                '--no-tags'
             ]
             
             repo = git.Repo.clone_from(
@@ -338,8 +101,12 @@ class ChunkedScanner:
                 multi_options=git_options
             )
 
-            repo_size = await self._get_directory_size(self.repo_dir)
-            size_gb = repo_size / (1024 ** 3)
+            # Calculate repository size
+            total_size = sum(
+                f.stat().st_size for f in self.repo_dir.rglob('*') 
+                if f.is_file() and not any(p in str(f) for p in self.config.exclude_patterns)
+            )
+            size_gb = total_size / (1024 ** 3)
             
             if size_gb > self.config.max_total_size_gb:
                 raise ValueError(
@@ -348,7 +115,6 @@ class ChunkedScanner:
                 )
 
             logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
-            logger.info(f"Detected languages: {', '.join(self.detected_languages)}")
             return self.repo_dir
 
         except Exception as e:
@@ -357,56 +123,28 @@ class ChunkedScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+        """Execute comprehensive semgrep scan"""
         try:
-            """Execute Semgrep scan with comprehensive configuration"""
-        
-            # Build base command
+            # Build enhanced semgrep command
             cmd = [
-            "semgrep",
-            "scan",
-            "--json",
-            
-            # Core Security Rulesets (verified available)
-            "--config", "p/security-audit",
-            "--config", "p/owasp-top-ten",
-            
-            # Language-specific rulesets (verified available)
-            "--config", "p/javascript",
-            "--config", "p/typescript",
-            "--config", "p/react",
-            "--config", "p/nodejs",
-            
-            # Security-specific rulesets (verified available)
-            "--config", "p/secrets",
-            "--config", "p/sql-injection",
-            "--config", "p/xss",
-            "--config", "p/jwt",
-            
-            # Performance Settings
-            "--max-memory", "4000",
-            "--timeout", "900",
-            "--severity", "INFO",
-            "--verbose",
-            "--metrics=on"
+                "semgrep",
+                "scan",
+                "--json",
+                "--config", "auto",  # Use auto config for comprehensive scanning
+                
+                # Performance and timeout settings
+                "--max-memory", str(self.config.max_memory_percent * 100),
+                "--timeout", str(self.config.timeout_seconds),
+                "--timeout-threshold", "3",
+                "--verbose",
+                "--metrics=on",
+                
+                # Filtering
+                "--exclude", ",".join(self.config.exclude_patterns),
+                
+                # Target directory
+                str(target_dir)
             ]
-
-            # Only add language-specific rulesets for detected languages
-            language_ruleset_map = {
-                'javascript': ['p/javascript', 'p/nodejs', 'p/react'],
-                'typescript': ['p/typescript'],
-                'html': ['p/security-audit'],  # Basic security checks for HTML
-                'css': ['p/security-audit']    # Basic security checks for CSS
-            }
-
-            # Add any detected language-specific rulesets
-            for lang in self.detected_languages:
-                if lang in language_ruleset_map:
-                    for ruleset in language_ruleset_map[lang]:
-                        if ruleset not in cmd:  # Avoid duplicate rulesets
-                            cmd.extend(["--config", ruleset])
-
-            # Add target directory
-            cmd.append(str(target_dir))
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -415,193 +153,170 @@ class ChunkedScanner:
                 cwd=str(target_dir)
             )
 
-            stdout, stderr = await process.communicate()
-            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                raise TimeoutError("Semgrep scan timed out")
+
             stderr_output = stderr.decode() if stderr else ""
-            if stderr_output and "No findings were found" not in stderr_output:
+            if stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
             output = stdout.decode() if stdout else ""
             if not output.strip():
-                return {}
+                return self._create_empty_result()
 
             # Parse and enhance results
             results = json.loads(output)
+            enhanced_results = self._enhance_scan_results(results)
             
-            # Process findings and collect statistics
-            processed_findings = []
-            severity_counts = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
-            category_counts = {}
+            return enhanced_results
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse semgrep output: {str(e)}")
+            return self._create_empty_result(error=str(e))
             
-            for finding in results.get('results', []):
-                # Detect language for the file
-                file_path = finding.get('path', '')
-                lang = self._detect_language(file_path) if file_path else None
-                
-                # Enhance finding with additional metadata
-                enhanced_finding = {
-                    'id': finding.get('check_id'),
-                    'file': finding.get('path'),
-                    'line_start': finding.get('start', {}).get('line'),
-                    'line_end': finding.get('end', {}).get('line'),
-                    'code_snippet': finding.get('extra', {}).get('lines', ''),
-                    'message': finding.get('extra', {}).get('message', ''),
-                    'severity': finding.get('extra', {}).get('severity', 'INFO'),
-                    'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
-                    'language': lang,
-                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                    'references': finding.get('extra', {}).get('metadata', {}).get('references', []),
-                    'fix_recommendations': {
-                        'description': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
-                        'references': finding.get('extra', {}).get('metadata', {}).get('fix_references', [])
-                    }
-                }
-                
-                # Update statistics
-                severity = enhanced_finding['severity']
-                category = enhanced_finding['category']
-                severity_counts[severity] = severity_counts.get(severity, 0) + 1
-                category_counts[category] = category_counts.get(category, 0) + 1
-                
-                processed_findings.append(enhanced_finding)
-                self.scan_stats['findings_count'] += 1
-
-            # Prepare comprehensive scan results
-            scan_results = {
-                'findings': processed_findings,
-                'stats': {
-                    'total_findings': len(processed_findings),
-                    'severity_counts': severity_counts,
-                    'category_counts': category_counts,
-                    'files_scanned': len(results.get('paths', {}).get('scanned', [])),
-                    'files_ignored': len(results.get('paths', {}).get('ignored', [])),
-                    'scan_duration': results.get('time', {}).get('duration_ms', 0) / 1000,
-                    'languages_detected': list(self.detected_languages)
-                },
-                'scan_metadata': {
-                    'semgrep_version': '1.96.0',
-                    'scan_start': self.scan_stats['start_time'].isoformat(),
-                    'scan_end': datetime.now().isoformat(),
-                    'total_files_analyzed': self.scan_stats['total_files'],
-                    'detected_languages': list(self.scan_stats['languages_detected'])
-                },
-                'errors': results.get('errors', []),
-                'paths': {
-                    'scanned': results.get('paths', {}).get('scanned', []),
-                    'ignored': results.get('paths', {}).get('ignored', [])
-                }
-            }
-
-            return scan_results
-
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
-            return {
-                'findings': [],
-                'stats': {
-                    'total_findings': 0,
-                    'error': str(e)
-                },
-                'scan_metadata': {
-                    'status': 'failed',
-                    'error': str(e)
-                },
-                'errors': [str(e)]
+            return self._create_empty_result(error=str(e))
+
+    def _enhance_scan_results(self, results: Dict) -> Dict:
+        """Enhance scan results with additional metadata and analysis"""
+        findings = results.get('results', [])
+        
+        # Process and categorize findings
+        processed_findings = []
+        severity_counts = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
+        category_counts = {}
+        
+        for finding in findings:
+            enhanced_finding = {
+                'id': finding.get('check_id'),
+                'file': finding.get('path'),
+                'line_start': finding.get('start', {}).get('line'),
+                'line_end': finding.get('end', {}).get('line'),
+                'code_snippet': finding.get('extra', {}).get('lines', ''),
+                'message': finding.get('extra', {}).get('message', ''),
+                'severity': finding.get('extra', {}).get('severity', 'INFO'),
+                'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
+                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', '')
             }
-    
+            
+            severity = enhanced_finding['severity']
+            category = enhanced_finding['category']
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            category_counts[category] = category_counts.get(category, 0) + 1
+            
+            processed_findings.append(enhanced_finding)
+            self.scan_stats['findings_count'] += 1
+
+        return {
+            'findings': processed_findings,
+            'stats': {
+                'total_findings': len(processed_findings),
+                'severity_counts': severity_counts,
+                'category_counts': category_counts,
+                'files_scanned': results.get('stats', {}).get('files_analyzed', 0),
+                'files_skipped': results.get('stats', {}).get('files_skipped', 0),
+                'scan_duration': results.get('time', {}).get('duration_ms', 0) / 1000
+            },
+            'errors': results.get('errors', [])
+        }
+
+    def _create_empty_result(self, error: Optional[str] = None) -> Dict:
+        """Create empty result structure with optional error"""
+        return {
+            'findings': [],
+            'stats': {
+                'total_findings': 0,
+                'severity_counts': {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0},
+                'category_counts': {},
+                'files_scanned': 0,
+                'files_skipped': 0,
+                'scan_duration': 0
+            },
+            'errors': [error] if error else []
+        }
+
     async def scan_repository(
         self,
         repo_url: str,
         token: str,
         user_id: Optional[str] = None
     ) -> Dict[str, Union[bool, Dict]]:
-        """Execute repository scanning and results processing"""
+        """Execute repository scanning workflow"""
         scan_start_time = datetime.now()
         
         try:
-            # Clone and analyze repository
+            # Clone and scan repository
             repo_path = await self._clone_repository(repo_url, token)
-            repo_size = await self._get_directory_size(repo_path)
-            size_mb = repo_size / (1024 * 1024)
-            
-            logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
+            logger.info(f"Starting security scan of repository")
             
             # Run semgrep scan
             scan_results = await self._run_semgrep_scan(repo_path)
             scan_duration = (datetime.now() - scan_start_time).total_seconds()
-            
-            # Format response
+
+            # Format comprehensive response
             response = {
                 'success': True,
                 'data': {
                     'repository': {
-                        'name': repo_url.split('github.com/')[-1].replace('.git', ''),
-                        'owner': repo_url.split('github.com/')[-1].split('/')[0],
-                        'repo': repo_url.split('github.com/')[-1].split('/')[1].replace('.git', '')
+                        'url': repo_url,
+                        'name': repo_url.split('/')[-1].replace('.git', ''),
+                        'owner': repo_url.split('/')[-2]
                     },
-                    'metadata': {
-                        'semgrep_version': scan_results.get('scan_metadata', {}).get('semgrep_version', 'unknown'),
-                        'status': 'completed',
-                        'timestamp': scan_start_time.isoformat(),
-                        'completion_timestamp': datetime.now().isoformat(),
-                        'scan_duration_seconds': scan_duration,
-                        'repository_size_mb': round(size_mb, 2),
-                        'languages_detected': list(self.detected_languages),
-                        'performance_metrics': {
-                            'total_duration_seconds': scan_duration,
-                            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024),
-                            'files_analyzed': scan_results.get('stats', {}).get('files_scanned', 0),
-                            'files_ignored': scan_results.get('stats', {}).get('files_ignored', 0)
-                        }
-                    },
-                    'summary': {
-                        'files_scanned': scan_results.get('stats', {}).get('files_scanned', 0),
-                        'scan_status': 'completed_with_errors' if scan_results.get('errors') else 'completed',
-                        'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
-                        'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
-                        'category_counts': scan_results.get('stats', {}).get('category_counts', {})
+                    'scan_info': {
+                        'started_at': scan_start_time.isoformat(),
+                        'completed_at': datetime.now().isoformat(),
+                        'duration_seconds': scan_duration,
+                        'status': 'completed_with_errors' if scan_results.get('errors') else 'completed'
                     },
                     'findings': scan_results.get('findings', []),
-                    'errors': scan_results.get('errors', []),
-                    'filters': {
-                        'available_severities': ['HIGH', 'MEDIUM', 'LOW', 'INFO'],
-                        'available_categories': list(set(finding.get('category', 'unknown') 
-                                                      for finding in scan_results.get('findings', [])))
+                    'statistics': {
+                        **scan_results.get('stats', {}),
+                        'scan_coverage': {
+                            'total_files_analyzed': self.scan_stats['total_files'],
+                            'files_processed': self.scan_stats['files_processed'],
+                            'files_excluded': self.scan_stats['excluded_files'],
+                            'files_skipped': self.scan_stats['skipped_files']
+                        }
                     },
-                    'pagination': {
-                        'current_page': 1,
-                        'per_page': 10,
-                        'total_items': len(scan_results.get('findings', [])),
-                        'total_pages': (len(scan_results.get('findings', [])) + 9) // 10
-                    }
+                    'errors': scan_results.get('errors', [])
                 }
             }
 
-            # Update database if session provided
+            # Store results in database if session provided
             if self.db_session is not None and user_id is not None:
                 try:
-                    from models import AnalysisResult
+                    from models import ScanResult
                     
-                    analysis = AnalysisResult(
-                        repository_name=response['data']['repository']['name'],
+                    scan_record = ScanResult(
                         user_id=user_id,
-                        status='completed',
+                        repository_url=repo_url,
+                        status=response['data']['scan_info']['status'],
+                        findings_count=response['data']['statistics']['total_findings'],
+                        scan_duration=scan_duration,
                         results=response['data']
                     )
                     
-                    self.db_session.add(analysis)
+                    self.db_session.add(scan_record)
                     self.db_session.commit()
                     
-                    response['data']['analysis_id'] = analysis.id
-                    logger.info(f"Analysis record {analysis.id} created successfully")
+                    response['data']['scan_id'] = scan_record.id
+                    logger.info(f"Scan record {scan_record.id} created successfully")
                     
                 except Exception as db_error:
                     logger.error(f"Database error: {str(db_error)}")
                     response['data']['database_error'] = str(db_error)
 
             return response
-            
+
         except Exception as e:
             logger.error(f"Scan failed: {str(e)}")
             return {
@@ -636,7 +351,7 @@ async def scan_repository_handler(
     try:
         config = ScanConfig()
         
-        async with ChunkedScanner(config, db_session) as scanner:
+        async with SecurityScanner(config, db_session) as scanner:
             results = await scanner.scan_repository(
                 repo_url,
                 installation_token,
@@ -659,9 +374,8 @@ async def scan_repository_handler(
 
 if __name__ == "__main__":
     import argparse
-    import sys
     
-    parser = argparse.ArgumentParser(description="Advanced Semgrep Security Scanner")
+    parser = argparse.ArgumentParser(description="Security Scanner")
     parser.add_argument("--repo-url", required=True, help="Repository URL to scan")
     parser.add_argument("--token", required=True, help="GitHub token for authentication")
     parser.add_argument("--user-id", required=True, help="User ID for the scan")
