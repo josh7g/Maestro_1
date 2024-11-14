@@ -326,8 +326,8 @@ class SecurityScanner:
                 'category_counts': category_counts,
                 'scan_stats': {
                     **self.scan_stats,
-                    'total_files_scanned': len(files_scanned),
-                    'files_with_findings': len(files_scanned),
+                    'total_files_scanned': self.scan_stats['total_files'],
+                    'files_with_findings': self.scan_stats['files_processed'],
                     'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds()
                 },
                 'memory_usage_mb': self.scan_stats['memory_usage_mb']
@@ -668,7 +668,65 @@ def get_analysis_findings(owner: str, repo: str):
             }
         }), 500
     
-
+@analysis_bp.route('/repository/<owner>/<repo>', methods=['GET'])
+def get_repository_analysis(owner, repo):
+    try:
+        repo_name = f"{owner}/{repo}"
+        
+        # Get the latest analysis result for the repository
+        result = AnalysisResult.query.filter_by(
+            repository_name=repo_name
+        ).order_by(
+            desc(AnalysisResult.timestamp)
+        ).first()
+        
+        if not result:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'No analysis found for the repository',
+                    'code': 'ANALYSIS_NOT_FOUND'
+                }
+            }), 404
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'repository': {
+                    'name': repo_name,
+                    'owner': owner,
+                    'repo': repo
+                },
+                'metadata': {
+                    'analysis_id': result.id,
+                    'timestamp': result.timestamp.isoformat(),
+                    'status': result.status,
+                    'duration_seconds': result.results.get('stats', {}).get('scan_stats', {}).get('scan_duration')
+                },
+                'summary': {
+                    'files_scanned': result.results.get('stats', {}).get('scan_stats', {}).get('total_files_scanned', 0),
+                    'total_findings': result.results.get('stats', {}).get('total_findings', 0),
+                    'severity_counts': result.results.get('stats', {}).get('severity_counts', {}),
+                    'category_counts': result.results.get('stats', {}).get('category_counts', {})
+                },
+                'findings': [format_finding(f) for f in result.results.get('findings', [])],
+                'repository_info': {
+                    'size_mb': result.results.get('repository_info', {}).get('size_mb', 0),
+                    'primary_language': result.results.get('repository_info', {}).get('primary_language', ''),
+                    'default_branch': result.results.get('repository_info', {}).get('default_branch', '')
+                }
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting repository analysis: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Internal server error',
+                'code': 'INTERNAL_ERROR'
+            }
+        }), 500
 if __name__ == '__main__':
     # Example usage for command-line testing
     async def main():
