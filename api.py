@@ -5,7 +5,7 @@ from collections import defaultdict
 import os
 import logging
 from pathlib import Path
-from github import Github
+from github import Github, GithubIntegration
 import logging
 
 logging.basicConfig(
