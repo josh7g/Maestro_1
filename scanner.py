@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
-    """Render-optimized scanning configuration"""
+    """Configuration settings for security scanning"""
     max_file_size_mb: int = 25
-    max_total_size_mb: int = 250     # Changed from max_total_size_gb
+    max_total_size_mb: int = 250
     max_memory_mb: int = 450
     
     # Timeouts
@@ -78,15 +78,16 @@ class ScanConfig:
         '*.mov'
     ])
 
+
 class SecurityScanner:
-    """Render-optimized security scanner"""
+    """Security scanner optimized for resource-constrained environments"""
     
     def __init__(self, config: ScanConfig = ScanConfig(), db_session: Optional[Session] = None):
         self.config = config
         self.db_session = db_session
         self.temp_dir = None
         self.repo_dir = None
-        self._session = None  # Add aiohttp session property
+        self._session = None
         self.scan_stats = {
             'start_time': None,
             'end_time': None,
@@ -111,7 +112,7 @@ class SecurityScanner:
     async def _setup(self):
         """Initialize scanner resources"""
         self.temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
-        self._session = aiohttp.ClientSession()  # Initialize aiohttp session
+        self._session = aiohttp.ClientSession()
         logger.info(f"Created temporary directory: {self.temp_dir}")
         self.scan_stats['start_time'] = datetime.now()
 
@@ -141,7 +142,8 @@ class SecurityScanner:
             
             async with self._session.get(api_url, headers=headers) as response:
                 if response.status != 200:
-                    raise ValueError(f"Failed to get repository info: {await response.text()}")
+                    error_text = await response.text()
+                    raise ValueError(f"Failed to get repository info: {error_text}")
                 
                 data = await response.json()
                 size_kb = data.get('size', 0)
@@ -159,7 +161,7 @@ class SecurityScanner:
             raise
 
     async def _clone_repository(self, repo_url: str, token: str) -> Path:
-        """Clone repository with size validation"""
+        """Clone repository with size validation and optimizations"""
         try:
             # Check repository size first
             size_info = await self._check_repository_size(repo_url, token)
@@ -174,11 +176,12 @@ class SecurityScanner:
             
             logger.info(f"Cloning repository to {self.repo_dir}")
             
-            # Basic clone with depth=1
+            # Optimized clone options
             git_options = [
                 '--depth=1',
                 '--single-branch',
-                '--no-tags'
+                '--no-tags',
+                f'--branch={size_info["default_branch"]}'
             ]
             
             repo = git.Repo.clone_from(
@@ -198,6 +201,12 @@ class SecurityScanner:
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute memory-conscious semgrep scan"""
         try:
+            # Create .semgrepignore file
+            semgrepignore_path = target_dir / '.semgrepignore'
+            with open(semgrepignore_path, 'w') as f:
+                for pattern in self.config.exclude_patterns:
+                    f.write(f"{pattern}\n")
+
             cmd = [
                 "semgrep",
                 "scan",
@@ -206,14 +215,16 @@ class SecurityScanner:
                 "--verbose",
                 "--metrics=on",
                 
-                # Render-specific optimizations
-                f"--max-memory", str(self.config.max_memory_mb),
-                "--jobs", "1",
-                "--timeout", str(self.config.file_timeout_seconds),
-                "--timeout-threshold", "2",
-                "--skip-git-ignores",
+                # Resource limits
+                f"--max-memory={self.config.max_memory_mb}",
+                f"--jobs={self.config.concurrent_processes}",
+                f"--timeout={self.config.file_timeout_seconds}",
+                f"--timeout-threshold={self.config.max_retries}",
+                
+                # Optimization flags
+                "--no-git-ignore",
                 "--skip-unknown-extensions",
-                "--optimizations", "all",
+                "--optimizations=all",
                 
                 str(target_dir)
             ]
@@ -238,30 +249,37 @@ class SecurityScanner:
             self.scan_stats['memory_usage_mb'] = psutil.Process().memory_info().rss / (1024 * 1024)
             
             stderr_output = stderr.decode() if stderr else ""
-            if stderr_output:
+            if stderr_output and not stderr_output.lower().startswith('running'):
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
             output = stdout.decode() if stdout else ""
             if not output.strip():
                 return self._create_empty_result()
 
-            results = json.loads(output)
-            return self._process_scan_results(results)
+            try:
+                results = json.loads(output)
+                return self._process_scan_results(results)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Semgrep JSON output: {str(e)}")
+                return self._create_empty_result(error="Invalid Semgrep output format")
 
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
             return self._create_empty_result(error=str(e))
+        finally:
+            if semgrepignore_path.exists():
+                semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results with memory tracking"""
+        """Process scan results with memory tracking and enhanced categorization"""
         findings = results.get('results', [])
         
         processed_findings = []
-        severity_counts = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
+        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
         category_counts = {}
         
         for finding in findings:
-            # Skip if finding processing would exceed memory limits
+            # Monitor memory usage during processing
             current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
             if current_memory > self.config.max_memory_mb:
                 logger.warning("Memory limit reached during result processing")
@@ -274,9 +292,12 @@ class SecurityScanner:
                 'line_end': finding.get('end', {}).get('line'),
                 'code_snippet': finding.get('extra', {}).get('lines', ''),
                 'message': finding.get('extra', {}).get('message', ''),
-                'severity': finding.get('extra', {}).get('severity', 'INFO'),
+                'severity': finding.get('extra', {}).get('severity', 'INFO').upper(),
                 'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
-                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', '')
+                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
+                'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
             }
             
             severity = enhanced_finding['severity']
@@ -300,23 +321,23 @@ class SecurityScanner:
         }
 
     def _create_empty_result(self, error: Optional[str] = None) -> Dict:
-        """Create empty result structure"""
+        """Create empty result structure with optional error information"""
         return {
             'findings': [],
             'stats': {
                 'total_findings': 0,
-                'severity_counts': {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0},
+                'severity_counts': {
+                    'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0
+                },
                 'category_counts': {},
                 'scan_stats': self.scan_stats,
                 'memory_usage_mb': self.scan_stats['memory_usage_mb']
             },
             'errors': [error] if error else []
         }
-# Add this method to the SecurityScanner class
+
     async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
-        """
-        Main method to scan a repository
-        """
+        """Main method to scan a repository with comprehensive error handling"""
         try:
             # Clone the repository
             repo_dir = await self._clone_repository(repo_url, installation_token)
@@ -353,16 +374,19 @@ class SecurityScanner:
                 'error': {
                     'message': str(e),
                     'code': 'SCAN_ERROR',
-                    'type': type(e).__name__
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat()
                 }
             }
+
+
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
     user_id: str,
     db_session: Optional[Session] = None
 ) -> Dict:
-    """Handler function for web routes"""
+    """Handler function for web routes with input validation"""
     logger.info(f"Starting scan request for repository: {repo_url}")
     
     if not all([repo_url, installation_token, user_id]):
@@ -371,6 +395,16 @@ async def scan_repository_handler(
             'error': {
                 'message': 'Missing required parameters',
                 'code': 'INVALID_PARAMETERS'
+            }
+        }
+
+    if not repo_url.startswith(('https://github.com/', 'git@github.com:')):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Invalid repository URL format',
+                'code': 'INVALID_REPOSITORY_URL',
+                'details': 'Only GitHub repositories are supported'
             }
         }
 
@@ -390,7 +424,7 @@ async def scan_repository_handler(
                             'details': {
                                 'size_mb': size_info['size_mb'],
                                 'limit_mb': config.max_total_size_mb,
-                                'recommendation': 'Consider analyzing specific directories or upgrading to a paid plan'
+                                'recommendation': 'Consider analyzing specific directories or branches'
                             }
                         }
                     }
@@ -401,6 +435,14 @@ async def scan_repository_handler(
                     user_id
                 )
                 
+                if results.get('success'):
+                    # Add repository metadata to results
+                    results['data']['repository_info'] = {
+                        'size_mb': size_info['size_mb'],
+                        'primary_language': size_info['language'],
+                        'default_branch': size_info['default_branch']
+                    }
+                
                 return results
 
             except ValueError as ve:
@@ -408,7 +450,19 @@ async def scan_repository_handler(
                     'success': False,
                     'error': {
                         'message': str(ve),
-                        'code': 'VALIDATION_ERROR'
+                        'code': 'VALIDATION_ERROR',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                }
+            
+            except git.GitCommandError as ge:
+                return {
+                    'success': False,
+                    'error': {
+                        'message': 'Git operation failed',
+                        'code': 'GIT_ERROR',
+                        'details': str(ge),
+                        'timestamp': datetime.now().isoformat()
                     }
                 }
 
@@ -418,8 +472,72 @@ async def scan_repository_handler(
             'success': False,
             'error': {
                 'message': 'Unexpected error in scan handler',
+                'code': 'INTERNAL_ERROR',
                 'details': str(e),
                 'type': type(e).__name__,
                 'timestamp': datetime.now().isoformat()
             }
         }
+
+
+# Optional: Add helper functions for common operations
+def format_file_size(size_bytes: int) -> str:
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
+
+
+def validate_repository_url(url: str) -> bool:
+    """Validate GitHub repository URL format"""
+    if not url:
+        return False
+    
+    # Support both HTTPS and SSH formats
+    valid_formats = [
+        r'https://github.com/[\w-]+/[\w-]+(?:\.git)?$',
+        r'git@github\.com:[\w-]+/[\w-]+(?:\.git)?$'
+    ]
+    
+    import re
+    return any(re.match(pattern, url) for pattern in valid_formats)
+
+
+def get_severity_weight(severity: str) -> int:
+    """Get numerical weight for severity level for sorting"""
+    weights = {
+        'CRITICAL': 5,
+        'HIGH': 4,
+        'MEDIUM': 3,
+        'LOW': 2,
+        'INFO': 1
+    }
+    return weights.get(severity.upper(), 0)
+
+
+def sort_findings_by_severity(findings: List[Dict]) -> List[Dict]:
+    """Sort findings by severity level"""
+    return sorted(
+        findings,
+        key=lambda x: get_severity_weight(x.get('severity', 'INFO')),
+        reverse=True
+    )
+
+
+if __name__ == '__main__':
+    # Example usage for command-line testing
+    async def main():
+        repo_url = os.getenv('GITHUB_REPO_URL')
+        token = os.getenv('GITHUB_TOKEN')
+        user_id = os.getenv('USER_ID', 'test-user')
+        
+        if not all([repo_url, token]):
+            print("Please set GITHUB_REPO_URL and GITHUB_TOKEN environment variables")
+            return
+        
+        result = await scan_repository_handler(repo_url, token, user_id)
+        print(json.dumps(result, indent=2))
+
+    asyncio.run(main())
