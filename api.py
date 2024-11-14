@@ -1,12 +1,14 @@
 from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request
 from sqlalchemy import func, desc
 from models import db, AnalysisResult
 from collections import defaultdict
 import os
 import logging
 from pathlib import Path
-from github import Github, Git_integration 
-import logging
+from github import Github
+from github import GithubIntegration
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +62,11 @@ def get_file_content(owner: str, repo: str, user_id: str, installation_id: str, 
             'success': False,
             'error': {'message': str(e)}
         }), 500
+
 @api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
 def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
+    from app import git_integration  # Import the git_integration instance from app.py
+    
     installation_id = request.args.get('installation_id')
     
     if not installation_id:
@@ -70,7 +75,7 @@ def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
             'error': {'message': 'Missing installation_id parameter'}
         }), 400
 
-    return get_file_content(owner, repo, user_id, installation_id, filename,Git_integration)
+    return get_file_content(owner, repo, user_id, installation_id, filename, git_integration)
 
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
 def get_repo_results(owner, repo):
