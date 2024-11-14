@@ -679,9 +679,7 @@ async def scan_repository():
             # Update database with results
             if scan_results['success']:
                 analysis.status = 'completed'
-                analysis.results = scan_results['data']['processed_results']
-                if 'raw_semgrep_output' in scan_results['data']:
-                    analysis.raw_results = scan_results['data']['raw_semgrep_output']
+                analysis.results = scan_results['data']
             else:
                 analysis.status = 'failed'
                 analysis.error = scan_results['error']['message']
