@@ -60,7 +60,6 @@ def get_repo_results(owner, repo):
 @api.route('/users/<user_id>/top-vulnerabilities', methods=['GET'])
 def get_top_vulnerabilities(user_id):
     try:
-        # Only get completed analyses with non-null results
         analyses = AnalysisResult.query.filter(
             AnalysisResult.user_id == user_id,
             AnalysisResult.status == 'completed',
@@ -70,73 +69,72 @@ def get_top_vulnerabilities(user_id):
         if not analyses:
             return jsonify({
                 'success': False,
-                'error': {
-                    'message': 'No valid analyses found',
-                    'code': 'NO_ANALYSES_FOUND'
-                }
+                'error': {'message': 'No analyses found'}
             }), 404
 
-        # Process and aggregate vulnerabilities
-        vulnerability_stats = defaultdict(lambda: {
-            'count': 0,
-            'severity': '',
-            'category': '',
-            'cwe': set(),
-            'owasp': set(),
-            'affected_repos': set()
-        })
+        # Track statistics
+        severity_counts = defaultdict(int)
+        category_counts = defaultdict(int)
+        repo_counts = defaultdict(int)
+        unique_vulns = {}
 
         for analysis in analyses:
-            try:
-                findings = analysis.results.get('findings', [])
-                if not findings:  # Skip if no findings
-                    continue
+            findings = analysis.results.get('findings', [])
+            repo_name = analysis.repository_name
+            
+            for finding in findings:
+                vuln_id = finding.get('id')
+                if vuln_id not in unique_vulns:
+                    unique_vulns[vuln_id] = {
+                        'vulnerability_id': vuln_id,
+                        'severity': finding.get('severity'),
+                        'category': finding.get('category'),
+                        'message': finding.get('message'),
+                        'code_snippet': finding.get('code_snippet'),
+                        'file': finding.get('file'),
+                        'line_range': {
+                            'start': finding.get('line_start'),
+                            'end': finding.get('line_end')
+                        },
+                        'security_references': {
+                            'cwe': finding.get('cwe', []),
+                            'owasp': finding.get('owasp', [])
+                        },
+                        'fix_recommendations': {
+                            'description': finding.get('fix_recommendations', ''),
+                            'references': finding.get('references', [])
+                        },
+                        'repository': {
+                            'name': repo_name.split('/')[-1],
+                            'full_name': repo_name,
+                            'analyzed_at': analysis.timestamp.isoformat()
+                        }
+                    }
                     
-                for finding in findings:
-                    vuln_id = finding.get('id')
-                    if vuln_id:
-                        stats = vulnerability_stats[vuln_id]
-                        stats['count'] += 1
-                        stats['severity'] = finding.get('severity', '')
-                        stats['category'] = finding.get('category', '')
-                        stats['cwe'].update(finding.get('cwe', []))
-                        stats['owasp'].update(finding.get('owasp', []))
-                        stats['affected_repos'].add(analysis.repository_name)
-            except Exception as e:
-                logger.error(f"Error processing analysis {analysis.id}: {str(e)}")
-                continue
-
-        # Convert to list and sort
-        vulnerabilities = [
-            {
-                'id': vuln_id,
-                'count': stats['count'],
-                'severity': stats['severity'],
-                'category': stats['category'],
-                'cwe': list(stats['cwe']),
-                'owasp': list(stats['owasp']),
-                'affected_repos': list(stats['affected_repos'])
-            }
-            for vuln_id, stats in vulnerability_stats.items()
-        ]
-
-        vulnerabilities.sort(key=lambda x: x['count'], reverse=True)
+                    severity_counts[finding.get('severity')] += 1
+                    category_counts[finding.get('category')] += 1
+                    repo_counts[repo_name] += 1
 
         return jsonify({
             'success': True,
             'data': {
-                'user_id': user_id,
-                'total_vulnerabilities': len(vulnerabilities),
-                'vulnerabilities': vulnerabilities
+                'metadata': {
+                    'user_id': user_id,
+                    'total_vulnerabilities': len(unique_vulns),
+                    'total_repositories': len(repo_counts),
+                    'severity_breakdown': severity_counts,
+                    'category_breakdown': category_counts,
+                    'repository_breakdown': repo_counts,
+                    'last_scan': analyses[0].timestamp.isoformat() if analyses else None,
+                    'repository': None  # For compatibility with existing format
+                },
+                'vulnerabilities': list(unique_vulns.values())
             }
         })
 
     except Exception as e:
-        logger.error(f"Error processing vulnerabilities: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         return jsonify({
             'success': False,
-            'error': {
-                'message': 'Failed to process vulnerabilities',
-                'details': str(e)
-            }
+            'error': {'message': str(e)}
         }), 500
