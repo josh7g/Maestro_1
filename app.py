@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import shutil
 import json
+import asyncio
 from github import Github, GithubIntegration
 from dotenv import load_dotenv
 from datetime import datetime
@@ -27,6 +28,10 @@ if os.getenv('FLASK_ENV') != 'production':
 app = Flask(__name__)
 CORS(app)
 asgi_app = WsgiToAsgi(app)
+
+# Create an event loop for async operations
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 
 
@@ -578,7 +583,7 @@ def root():
     }), 200
     
 @app.route('/api/v1/analysis/scan', methods=['POST'])
-async def scan_repository():
+def scan_repository():
     """Scan a specific repository with mandatory user ID"""
     try:
         if not request.is_json:
@@ -677,16 +682,18 @@ async def scan_repository():
                 concurrent_processes=1
             )
             
-            # Run scan with timeout
+            # Run scan with timeout using the event loop
             try:
-                scan_results = await asyncio.wait_for(
-                    scan_repository_handler(
-                        repo_url=repo_url,
-                        installation_token=installation_token,
-                        user_id=user_id,
-                        db_session=db.session
-                    ),
-                    timeout=300  # 5 minutes total timeout
+                scan_results = loop.run_until_complete(
+                    asyncio.wait_for(
+                        scan_repository_handler(
+                            repo_url=repo_url,
+                            installation_token=installation_token,
+                            user_id=user_id,
+                            db_session=db.session
+                        ),
+                        timeout=300  # 5 minutes total timeout
+                    )
                 )
                 
                 if not scan_results['success']:
