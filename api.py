@@ -5,6 +5,8 @@ from collections import defaultdict
 import os
 import logging
 from pathlib import Path
+from github import Github
+import logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,6 +16,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 api = Blueprint('api', __name__, url_prefix='/api/v1')
+
+def get_file_content(owner: str, repo: str, user_id: str, installation_id: str, filename: str, gh_integration):
+    """
+    Fetch vulnerable file content from GitHub
+    """
+    try:
+        # Get GitHub token
+        installation_token = gh_integration.get_access_token(int(installation_id)).token
+        gh = Github(installation_token)
+        
+        repository = gh.get_repo(f"{owner}/{repo}")
+        default_branch = repository.default_branch
+        latest_commit = repository.get_branch(default_branch).commit
+        commit_sha = latest_commit.sha
+
+        # Get file content from GitHub
+        try:
+            file_content = repository.get_contents(filename, ref=commit_sha)
+            content = file_content.decoded_content.decode('utf-8')
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'file': content,
+                    'user_id': user_id,
+                    'version': commit_sha,
+                    'reponame': f"{owner}/{repo}",
+                    'filename': filename
+                }
+            })
+
+        except Exception as e:
+            logger.error(f"Error fetching file: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {'message': 'File not found or inaccessible'}
+            }), 404
+
+    except Exception as e:
+        logger.error(f"GitHub API error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {'message': str(e)}
+        }), 500
+@api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
+def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
+    installation_id = request.args.get('installation_id')
+    
+    if not installation_id:
+        return jsonify({
+            'success': False,
+            'error': {'message': 'Missing installation_id parameter'}
+        }), 400
+
+    return get_file_content(owner, repo, user_id, installation_id, filename, git_integration)
 
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
 def get_repo_results(owner, repo):
@@ -149,68 +206,3 @@ def get_top_vulnerabilities(user_id):
             'error': {'message': str(e)}
         }), 500
 
-@api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
-def get_file_content(owner: str, repo: str, user_id: str, filename: str):
-    try:
-        repository = f"{owner}/{repo}"
-        
-        # Get the latest analysis result for this repository
-        result = AnalysisResult.query.filter_by(
-            user_id=user_id,
-            repository_name=repository
-        ).order_by(desc(AnalysisResult.timestamp)).first()
-        
-        if not result:
-            return jsonify({
-                'success': False,
-                'error': {'message': 'No analysis results found'}
-            }), 404
-            
-        # Find the file in the findings
-        findings = result.results.get('findings', [])
-        target_file = None
-        
-        for finding in findings:
-            if finding.get('file', '').endswith(filename):
-                target_file = finding.get('file')
-                break
-                
-        if not target_file:
-            return jsonify({
-                'success': False,
-                'error': {'message': f'File {filename} not found in analysis results'}
-            }), 404
-            
-        # Get absolute path from finding
-        file_path = Path(target_file)
-        
-        if not file_path.exists():
-            return jsonify({
-                'success': False,
-                'error': {'message': 'File no longer exists on disk'}
-            }), 404
-            
-        with open(file_path, 'r') as f:
-            file_content = f.read()
-            
-        version = "1.0"
-        if result.results.get('metadata', {}).get('version'):
-            version = result.results['metadata']['version']
-            
-        return jsonify({
-            'success': True,
-            'data': {
-                'file': file_content,
-                'user_id': user_id,
-                'version': version,
-                'reponame': repository,
-                'filename': filename
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Error reading file content: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': {'message': str(e)}
-        }), 500
