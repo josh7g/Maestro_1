@@ -152,24 +152,23 @@ def get_file_content(owner: str, repo: str, user_id: str, filename: str):
     try:
         repository = f"{owner}/{repo}"
         
-        # Get latest analysis result for version info
-        result = AnalysisResult.query.filter_by(
-            user_id=user_id,
-            repository_name=repository
-        ).order_by(desc(AnalysisResult.timestamp)).first()
+        # Use same temp directory pattern as scanner
+        repo_pattern = f"repo_{datetime.now().strftime('%Y%m%d')}"
+        base_dir = Path(tempfile.gettempdir())
         
-        # Get the repository path
-        repo_dir = Path(config.REPOS_DIR) / user_id / repository
-        
-        if not repo_dir.exists():
+        # Find the most recent repo directory
+        repo_dirs = list(base_dir.glob(f"scanner_*/repo_*"))
+        if not repo_dirs:
             return jsonify({
                 'success': False,
                 'error': {'message': 'Repository not found'}
             }), 404
+            
+        repo_dir = sorted(repo_dirs, key=lambda x: x.stat().st_mtime)[-1]
         
         file_path = repo_dir / filename
         
-        # Security check - ensure file is within repo directory
+        # Security check
         if not str(file_path).startswith(str(repo_dir)):
             return jsonify({
                 'success': False,
@@ -185,7 +184,12 @@ def get_file_content(owner: str, repo: str, user_id: str, filename: str):
         with open(file_path, 'r') as f:
             file_content = f.read()
             
-        # Get version from analysis results, default to "1.0"
+        # Get version from analysis results
+        result = AnalysisResult.query.filter_by(
+            user_id=user_id,
+            repository_name=repository
+        ).order_by(desc(AnalysisResult.timestamp)).first()
+        
         version = "1.0"
         if result and result.results.get('metadata', {}).get('version'):
             version = result.results['metadata']['version']
