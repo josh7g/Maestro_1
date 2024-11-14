@@ -12,9 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from sqlalchemy.orm import Session
-from models import AnalysisResult
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -24,23 +22,56 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
-    """Configuration for repository scanning"""
-    max_file_size_mb: int = 100
-    max_total_size_gb: int = 5
-    max_memory_mb: int = 2048
-    timeout_seconds: int = 3600
-    max_retries: int = 3
+    """Render-optimized scanning configuration"""
+    max_file_size_mb: int = 25         # Individual file size limit
+    max_total_size_mb: int = 250       # Total repository size limit
+    max_memory_mb: int = 450           # Leave some headroom from 512MB
+    timeout_seconds: int = 300         # 5 minutes total
+    file_timeout_seconds: int = 30     # 30 seconds per file
     exclude_patterns: List[str] = field(default_factory=lambda: [
+        # Version Control
         '.git',
+        '.svn',
+        
+        # Dependencies
         'node_modules',
+        'vendor',
+        'bower_components',
+        'packages',
+        
+        # Build outputs
+        'dist',
+        'build',
+        'out',
+        
+        # Environment
         'venv',
         '.env',
         '__pycache__',
-        '.pytest_cache'
+        
+        # Minified files
+        '*.min.js',
+        '*.min.css',
+        '*.bundle.js',
+        '*.bundle.css',
+        '*.map',
+        
+        # Large file types
+        '*.pdf',
+        '*.jpg',
+        '*.jpeg',
+        '*.png',
+        '*.gif',
+        '*.zip',
+        '*.tar',
+        '*.gz',
+        '*.rar',
+        '*.mp4',
+        '*.mov'
     ])
 
 class SecurityScanner:
-    """Enhanced security scanner implementation"""
+    """Render-optimized security scanner"""
     
     def __init__(self, config: ScanConfig = ScanConfig(), db_session: Optional[Session] = None):
         self.config = config
@@ -52,13 +83,13 @@ class SecurityScanner:
             'end_time': None,
             'total_files': 0,
             'files_processed': 0,
-            'findings_count': 0,
-            'excluded_files': 0,
-            'skipped_files': 0
+            'files_skipped': 0,
+            'files_too_large': 0,
+            'total_size_mb': 0,
+            'memory_usage_mb': 0,
+            'findings_count': 0
         }
-    class SecurityScanner:
-        """Enhanced security scanner implementation"""
-    
+
     async def __aenter__(self):
         await self._setup()
         return self
@@ -82,16 +113,55 @@ class SecurityScanner:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
-    async def _clone_repository(self, repo_url: str, token: str) -> Path:
-        """Clone repository with authentication"""
+    async def _check_repository_size(self, repo_url: str, token: str) -> Dict:
+        """Pre-check repository size using GitHub API"""
         try:
+            owner, repo = repo_url.split('github.com/')[-1].replace('.git', '').split('/')
+            api_url = f"https://api.github.com/repos/{owner}/{repo}"
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Failed to get repository info: {await response.text()}")
+                    
+                    data = await response.json()
+                    size_kb = data.get('size', 0)
+                    size_mb = size_kb / 1024
+
+                    return {
+                        'size_mb': size_mb,
+                        'is_compatible': size_mb <= self.config.max_total_size_mb,
+                        'language': data.get('language'),
+                        'default_branch': data.get('default_branch')
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error checking repository size: {str(e)}")
+            raise
+
+    async def _clone_repository(self, repo_url: str, token: str) -> Path:
+        """Clone repository with size validation"""
+        try:
+            # Check repository size first
+            size_info = await self._check_repository_size(repo_url, token)
+            if not size_info['is_compatible']:
+                raise ValueError(
+                    f"Repository size ({size_info['size_mb']:.2f}MB) exceeds "
+                    f"limit of {self.config.max_total_size_mb}MB"
+                )
+
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             auth_url = repo_url.replace('https://', f'https://x-access-token:{token}@')
-
+            
             logger.info(f"Cloning repository to {self.repo_dir}")
             
-            # Basic git options
+            # Basic clone with depth=1
             git_options = [
+                '--depth=1',
                 '--single-branch',
                 '--no-tags'
             ]
@@ -102,20 +172,7 @@ class SecurityScanner:
                 multi_options=git_options
             )
 
-            # Calculate repository size
-            total_size = sum(
-                f.stat().st_size for f in self.repo_dir.rglob('*') 
-                if f.is_file() and not any(p in str(f) for p in self.config.exclude_patterns)
-            )
-            size_gb = total_size / (1024 ** 3)
-            
-            if size_gb > self.config.max_total_size_gb:
-                raise ValueError(
-                    f"Repository size ({size_gb:.2f} GB) exceeds "
-                    f"limit of {self.config.max_total_size_gb} GB"
-                )
-
-            logger.info(f"Successfully cloned repository: {size_gb:.2f} GB")
+            logger.info(f"Successfully cloned repository: {size_info['size_mb']:.2f}MB")
             return self.repo_dir
 
         except Exception as e:
@@ -124,7 +181,7 @@ class SecurityScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with memory optimization"""
+        """Execute memory-conscious semgrep scan"""
         try:
             cmd = [
                 "semgrep",
@@ -134,11 +191,14 @@ class SecurityScanner:
                 "--verbose",
                 "--metrics=on",
                 
-                # Memory optimization settings
+                # Render-specific optimizations
                 f"--max-memory", str(self.config.max_memory_mb),
                 "--jobs", "1",
-                "--timeout", "300",
-                "--timeout-threshold", "3",
+                "--timeout", str(self.config.file_timeout_seconds),
+                "--timeout-threshold", "2",
+                "--skip-git-ignores",
+                "--skip-unknown-extensions",
+                "--optimizations", "all",
                 
                 str(target_dir)
             ]
@@ -157,8 +217,11 @@ class SecurityScanner:
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                raise TimeoutError("Semgrep scan timed out")
+                logger.error(f"Scan timed out after {self.config.timeout_seconds}s")
+                return self._create_empty_result(error="Scan timed out")
 
+            self.scan_stats['memory_usage_mb'] = psutil.Process().memory_info().rss / (1024 * 1024)
+            
             stderr_output = stderr.decode() if stderr else ""
             if stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
@@ -175,7 +238,7 @@ class SecurityScanner:
             return self._create_empty_result(error=str(e))
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results"""
+        """Process scan results with memory tracking"""
         findings = results.get('results', [])
         
         processed_findings = []
@@ -183,6 +246,12 @@ class SecurityScanner:
         category_counts = {}
         
         for finding in findings:
+            # Skip if finding processing would exceed memory limits
+            current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
+            if current_memory > self.config.max_memory_mb:
+                logger.warning("Memory limit reached during result processing")
+                break
+
             enhanced_finding = {
                 'id': finding.get('check_id'),
                 'file': finding.get('path'),
@@ -197,6 +266,7 @@ class SecurityScanner:
             
             severity = enhanced_finding['severity']
             category = enhanced_finding['category']
+            
             severity_counts[severity] = severity_counts.get(severity, 0) + 1
             category_counts[category] = category_counts.get(category, 0) + 1
             
@@ -209,11 +279,9 @@ class SecurityScanner:
                 'total_findings': len(processed_findings),
                 'severity_counts': severity_counts,
                 'category_counts': category_counts,
-                'files_scanned': results.get('stats', {}).get('files_analyzed', 0),
-                'files_skipped': results.get('stats', {}).get('files_skipped', 0),
-                'scan_duration': results.get('time', {}).get('duration_ms', 0) / 1000
-            },
-            'errors': results.get('errors', [])
+                'scan_stats': self.scan_stats,
+                'memory_usage_mb': self.scan_stats['memory_usage_mb']
+            }
         }
 
     def _create_empty_result(self, error: Optional[str] = None) -> Dict:
@@ -224,95 +292,11 @@ class SecurityScanner:
                 'total_findings': 0,
                 'severity_counts': {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0},
                 'category_counts': {},
-                'files_scanned': 0,
-                'files_skipped': 0,
-                'scan_duration': 0
+                'scan_stats': self.scan_stats,
+                'memory_usage_mb': self.scan_stats['memory_usage_mb']
             },
             'errors': [error] if error else []
         }
-
-    async def scan_repository(
-        self,
-        repo_url: str,
-        token: str,
-        user_id: Optional[str] = None
-    ) -> Dict[str, Union[bool, Dict]]:
-        """Execute repository scanning workflow"""
-        scan_start_time = datetime.now()
-        
-        try:
-            # Clone and scan repository
-            repo_path = await self._clone_repository(repo_url, token)
-            logger.info(f"Starting scan of repository")
-            
-            # Run semgrep scan
-            scan_results = await self._run_semgrep_scan(repo_path)
-            scan_duration = (datetime.now() - scan_start_time).total_seconds()
-            
-            # Format response
-            response = {
-                'success': True,
-                'data': {
-                    'repository': {
-                        'name': repo_url.split('github.com/')[-1].replace('.git', ''),
-                        'owner': repo_url.split('github.com/')[-1].split('/')[0],
-                        'repo': repo_url.split('github.com/')[-1].split('/')[1].replace('.git', '')
-                    },
-                    'metadata': {
-                        'status': 'completed',
-                        'timestamp': scan_start_time.isoformat(),
-                        'completion_timestamp': datetime.now().isoformat(),
-                        'scan_duration_seconds': scan_duration,
-                        'performance_metrics': {
-                            'total_duration_seconds': scan_duration,
-                            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
-                        }
-                    },
-                    'summary': {
-                        'total_findings': scan_results['stats']['total_findings'],
-                        'severity_counts': scan_results['stats']['severity_counts'],
-                        'category_counts': scan_results['stats']['category_counts'],
-                        'files_scanned': scan_results['stats']['files_scanned'],
-                        'files_skipped': scan_results['stats']['files_skipped']
-                    },
-                    'findings': scan_results['findings'],
-                    'errors': scan_results['errors']
-                }
-            }
-
-            # Update database
-            if self.db_session is not None and user_id is not None:
-                try:
-                    analysis = AnalysisResult(
-                        repository_name=response['data']['repository']['name'],
-                        user_id=user_id,
-                        status='completed',
-                        results=response['data'],
-                        error=None if response['success'] else str(scan_results.get('errors', []))
-                    )
-                    
-                    self.db_session.add(analysis)
-                    self.db_session.commit()
-                    
-                    response['data']['analysis_id'] = analysis.id
-                    logger.info(f"Analysis record {analysis.id} created successfully")
-                    
-                except Exception as db_error:
-                    logger.error(f"Database error: {str(db_error)}")
-                    response['data']['database_error'] = str(db_error)
-
-            return response
-
-        except Exception as e:
-            logger.error(f"Scan failed: {str(e)}")
-            return {
-                'success': False,
-                'error': {
-                    'message': str(e),
-                    'type': type(e).__name__,
-                    'timestamp': datetime.now().isoformat()
-                }
-            }
 
 async def scan_repository_handler(
     repo_url: str,
@@ -336,13 +320,39 @@ async def scan_repository_handler(
         config = ScanConfig()
         
         async with SecurityScanner(config, db_session) as scanner:
-            results = await scanner.scan_repository(
-                repo_url,
-                installation_token,
-                user_id
-            )
-            
-            return results
+            try:
+                # Pre-check repository size
+                size_info = await scanner._check_repository_size(repo_url, installation_token)
+                if not size_info['is_compatible']:
+                    return {
+                        'success': False,
+                        'error': {
+                            'message': 'Repository too large for analysis',
+                            'code': 'REPOSITORY_TOO_LARGE',
+                            'details': {
+                                'size_mb': size_info['size_mb'],
+                                'limit_mb': config.max_total_size_mb,
+                                'recommendation': 'Consider analyzing specific directories or upgrading to a paid plan'
+                            }
+                        }
+                    }
+                
+                results = await scanner.scan_repository(
+                    repo_url,
+                    installation_token,
+                    user_id
+                )
+                
+                return results
+
+            except ValueError as ve:
+                return {
+                    'success': False,
+                    'error': {
+                        'message': str(ve),
+                        'code': 'VALIDATION_ERROR'
+                    }
+                }
 
     except Exception as e:
         logger.error(f"Handler error: {str(e)}")
@@ -355,29 +365,3 @@ async def scan_repository_handler(
                 'timestamp': datetime.now().isoformat()
             }
         }
-
-if __name__ == "__main__":
-    import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description="Security Scanner")
-    parser.add_argument("--repo-url", required=True, help="Repository URL to scan")
-    parser.add_argument("--token", required=True, help="GitHub token for authentication")
-    parser.add_argument("--user-id", required=True, help="User ID for the scan")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    try:
-        result = asyncio.run(scan_repository_handler(
-            args.repo_url,
-            args.token,
-            args.user_id
-        ))
-        print(json.dumps(result, indent=2))
-    except Exception as e:
-        logger.error(f"Scanner failed: {str(e)}")
-        sys.exit(1)
