@@ -119,17 +119,14 @@ class SecurityScanner:
     async def _cleanup(self):
         """Cleanup scanner resources"""
         try:
-            if self.temp_dir and self.temp_dir.exists():
-                shutil.rmtree(self.temp_dir)
-                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
-                self.scan_stats['end_time'] = datetime.now()
             
+        
             if self._session and not self._session.closed:
                 await self._session.close()
                 
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
-
+    
     async def _check_repository_size(self, repo_url: str, token: str) -> Dict:
         """Pre-check repository size using GitHub API"""
         try:
