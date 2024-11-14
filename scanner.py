@@ -312,7 +312,50 @@ class SecurityScanner:
             },
             'errors': [error] if error else []
         }
-
+# Add this method to the SecurityScanner class
+async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
+    """
+    Main method to scan a repository
+    """
+    try:
+        # Clone the repository
+        repo_dir = await self._clone_repository(repo_url, installation_token)
+        
+        # Run the semgrep scan
+        scan_results = await self._run_semgrep_scan(repo_dir)
+        
+        return {
+            'success': True,
+            'data': {
+                'repository': repo_url,
+                'user_id': user_id,
+                'timestamp': datetime.now().isoformat(),
+                'findings': scan_results.get('findings', []),
+                'summary': {
+                    'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
+                    'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
+                    'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
+                    'files_scanned': self.scan_stats['files_processed'],
+                },
+                'metadata': {
+                    'scan_duration_seconds': (
+                        datetime.now() - self.scan_stats['start_time']
+                    ).total_seconds() if self.scan_stats['start_time'] else 0,
+                    'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Scan repository error: {str(e)}")
+        return {
+            'success': False,
+            'error': {
+                'message': str(e),
+                'code': 'SCAN_ERROR',
+                'type': type(e).__name__
+            }
+        }
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
