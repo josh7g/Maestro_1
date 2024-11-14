@@ -116,8 +116,9 @@ class ChunkedScanner:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
-    def _detect_language(self, file_extension: str) -> Optional[str]:
-        """Detect programming language from file extension"""
+    def _detect_language(self, file_path: str) -> Optional[str]:
+        """Detect programming language from file path"""
+        extension = os.path.splitext(file_path)[1].lower()
         extension_map = {
             '.js': 'javascript',
             '.jsx': 'javascript',
@@ -128,7 +129,7 @@ class ChunkedScanner:
             '.java': 'java',
             '.cs': 'csharp'
         }
-        return extension_map.get(file_extension.lower())
+        return extension_map.get(extension)
 
     async def _get_directory_size(self, directory: Path) -> int:
         """Calculate directory size excluding ignored paths"""
@@ -146,6 +147,10 @@ class ChunkedScanner:
                     file_path = Path(dirpath) / filename
                     try:
                         total_size += file_path.stat().st_size
+                        # Detect language for the file
+                        lang = self._detect_language(str(file_path))
+                        if lang:
+                            self.detected_languages.add(lang)
                     except (OSError, FileNotFoundError):
                         continue
         except Exception as e:
@@ -189,7 +194,7 @@ class ChunkedScanner:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
- 
+
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute Semgrep scan with optimized configuration"""
         try:
@@ -214,11 +219,12 @@ class ChunkedScanner:
 
             stdout, stderr = await process.communicate()
             
+            output = stdout.decode() if stdout else ""
             stderr_output = stderr.decode() if stderr else ""
+
             if stderr_output and "No findings were found" not in stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
-            output = stdout.decode() if stdout else ""
             if not output.strip():
                 return {}
 
@@ -227,14 +233,6 @@ class ChunkedScanner:
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
             return {}
-
-    def _count_severities(self, findings: List[Dict]) -> Dict[str, int]:
-        """Count findings by severity"""
-        severity_counts = {}
-        for finding in findings:
-            severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-        return severity_counts
 
     async def scan_repository(
         self,
@@ -252,43 +250,64 @@ class ChunkedScanner:
             
             logger.info(f"Starting scan of repository ({size_mb:.2f} MB)")
             
-            # Get raw semgrep results
-            semgrep_results = await self._run_semgrep_scan(repo_path)
+            semgrep_output = await self._run_semgrep_scan(repo_path)
             scan_duration = (datetime.now() - scan_start_time).total_seconds()
-            
-            # Process the results into our desired format
+
+            # Process findings
+            formatted_findings = []
+            for finding in semgrep_output.get('results', []):
+                formatted_finding = {
+                    'id': finding.get('check_id'),
+                    'file': finding.get('path'),
+                    'line_start': finding.get('start', {}).get('line'),
+                    'line_end': finding.get('end', {}).get('line'),
+                    'code_snippet': finding.get('extra', {}).get('lines', ''),
+                    'message': finding.get('extra', {}).get('message', ''),
+                    'severity': finding.get('extra', {}).get('severity', 'INFO'),
+                    'category': 'security',
+                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                    'fix_recommendations': {
+                        'description': finding.get('extra', {}).get('metadata', {}).get('message', ''),
+                        'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                    }
+                }
+                formatted_findings.append(formatted_finding)
+
+            # Prepare response
             response = {
                 'success': True,
                 'data': {
-                    'results': semgrep_results.get('results', []),  # Direct semgrep findings
-                    'errors': semgrep_results.get('errors', []),
-                    'paths': semgrep_results.get('paths', {}),
-                    'version': semgrep_results.get('version', 'unknown'),
-                    'stats': {
-                        'total_findings': len(semgrep_results.get('results', [])),
-                        'total_errors': len(semgrep_results.get('errors', [])),
-                        'scan_duration': semgrep_results.get('time', {}).get('duration_ms', 0) / 1000,
-                        'files_scanned': len(semgrep_results.get('paths', {}).get('scanned', [])),
-                        'files_ignored': len(semgrep_results.get('paths', {}).get('ignored', [])),
+                    'repository': {
+                        'name': repo_url.split('github.com/')[-1].replace('.git', ''),
+                        'owner': repo_url.split('github.com/')[-1].split('/')[0],
+                        'repo': repo_url.split('github.com/')[-1].split('/')[1].replace('.git', '')
                     },
-                    'severity_counts': self._count_severities(semgrep_results.get('results', [])),
-                    'scan_status': 'completed',
-                    'scan_duration_seconds': scan_duration,
                     'metadata': {
-                        'repository_size_mb': round(size_mb, 2),
-                        'scan_timestamp': scan_start_time.isoformat(),
-                        'completion_timestamp': datetime.now().isoformat(),
-                        'files_analyzed': len(semgrep_results.get('paths', {}).get('scanned', [])),
-                        'findings_count': len(semgrep_results.get('results', [])),
-                        'detected_languages': list(self.detected_languages),
-                        'performance_metrics': {
-                            'total_duration_seconds': scan_duration,
-                            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
-                        }
+                        'semgrep_version': semgrep_output.get('version', 'unknown'),
+                        'status': 'completed',
+                        'timestamp': scan_start_time.isoformat()
+                    },
+                    'summary': {
+                        'files_scanned': len(semgrep_output.get('paths', {}).get('scanned', [])),
+                        'scan_status': 'completed_with_errors' if semgrep_output.get('errors') else 'completed',
+                        'total_findings': len(formatted_findings)
+                    },
+                    'findings': formatted_findings,
+                    'filters': {
+                        'available_severities': ['HIGH', 'MEDIUM', 'LOW', 'WARNING', 'INFO'],
+                        'available_categories': ['security']
+                    },
+                    'pagination': {
+                        'current_page': 1,
+                        'per_page': 10,
+                        'total_items': len(formatted_findings),
+                        'total_pages': (len(formatted_findings) + 9) // 10
                     }
                 }
             }
 
+            # Update database if session provided
             if self.db_session is not None and user_id is not None:
                 try:
                     from models import AnalysisResult
@@ -323,7 +342,7 @@ class ChunkedScanner:
             }
         finally:
             await self._cleanup()
-   
+
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
