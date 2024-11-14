@@ -6,6 +6,7 @@ import psutil
 import tempfile
 import shutil
 import asyncio
+import aiohttp
 import git
 from typing import Dict, List, Optional, Union
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ScanConfig:
@@ -84,6 +86,7 @@ class SecurityScanner:
         self.db_session = db_session
         self.temp_dir = None
         self.repo_dir = None
+        self._session = None  # Add aiohttp session property
         self.scan_stats = {
             'start_time': None,
             'end_time': None,
@@ -102,10 +105,13 @@ class SecurityScanner:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._cleanup()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def _setup(self):
         """Initialize scanner resources"""
         self.temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
+        self._session = aiohttp.ClientSession()  # Initialize aiohttp session
         logger.info(f"Created temporary directory: {self.temp_dir}")
         self.scan_stats['start_time'] = datetime.now()
 
@@ -116,6 +122,10 @@ class SecurityScanner:
                 shutil.rmtree(self.temp_dir)
                 logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
                 self.scan_stats['end_time'] = datetime.now()
+            
+            if self._session and not self._session.closed:
+                await self._session.close()
+                
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
@@ -129,21 +139,20 @@ class SecurityScanner:
                 'Accept': 'application/vnd.github.v3+json'
             }
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(api_url) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Failed to get repository info: {await response.text()}")
-                    
-                    data = await response.json()
-                    size_kb = data.get('size', 0)
-                    size_mb = size_kb / 1024
+            async with self._session.get(api_url, headers=headers) as response:
+                if response.status != 200:
+                    raise ValueError(f"Failed to get repository info: {await response.text()}")
+                
+                data = await response.json()
+                size_kb = data.get('size', 0)
+                size_mb = size_kb / 1024
 
-                    return {
-                        'size_mb': size_mb,
-                        'is_compatible': size_mb <= self.config.max_total_size_mb,
-                        'language': data.get('language'),
-                        'default_branch': data.get('default_branch')
-                    }
+                return {
+                    'size_mb': size_mb,
+                    'is_compatible': size_mb <= self.config.max_total_size_mb,
+                    'language': data.get('language'),
+                    'default_branch': data.get('default_branch')
+                }
                     
         except Exception as e:
             logger.error(f"Error checking repository size: {str(e)}")
