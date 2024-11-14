@@ -1,5 +1,3 @@
-
-# scanner.py
 import os
 import subprocess
 import logging
@@ -152,101 +150,32 @@ class ChunkedScanner:
         # Documentation and Others
         '.md', '.txt', '.sql', '.graphql', '.proto'
     }
-    
+
     SEMGREP_RULESETS = {
-        # Web Technologies
         'javascript': [
             'p/javascript',
             'p/nodejs',
             'p/react',
-            'p/typescript',
-            'p/express',
-            'p/angular',
-            'p/vue'
+            'p/typescript'
         ],
         'python': [
             'p/python',
             'p/flask',
-            'p/django',
-            'p/fastapi',
-            'p/numpy',
-            'p/pandas'
+            'p/django'
         ],
         'java': [
-            'p/java',
-            'p/spring',
-            'p/spring-security',
-            'p/jakarta-ee'
+            'p/java'
         ],
-        'csharp': [
-            'p/csharp',
-            'p/dotnet',
-            'p/asp',
-            'p/unity'
-        ],
-        'go': [
-            'p/golang',
-            'p/gorilla',
-            'p/gin'
-        ],
-        'php': [
-            'p/php',
-            'p/symfony',
-            'p/laravel'
-        ],
-        'ruby': [
-            'p/ruby',
-            'p/rails'
-        ],
-        'scala': [
-            'p/scala',
-            'p/play'
-        ],
-        # Infrastructure and Configuration
-        'infrastructure': [
-            'p/terraform',
-            'p/kubernetes',
-            'p/docker',
-            'p/helm',
-            'p/ansible',
-            'p/cloudformation'
-        ],
-        # Security-focused rulesets
         'security': [
             'p/security-audit',
             'p/owasp-top-ten',
             'p/jwt',
             'p/secrets',
             'p/sql-injection',
-            'p/xss',
-            'p/auth',
-            'p/insecure-transport',
-            'p/crypto',
-            'p/deserialization',
-            'p/command-injection'
+            'p/xss'
         ],
-        # Code Quality and Best Practices
         'quality': [
-            'p/ci',
-            'p/performance',
-            'p/best-practice',
-            'p/maintenance',
-            'p/compatibility',
-            'p/regex'
-        ],
-        # Mobile Development
-        'mobile': [
-            'p/android',
-            'p/kotlin',
-            'p/swift',
-            'p/react-native'
-        ],
-        # Data and APIs
-        'data': [
-            'p/graphql',
-            'p/r2c-ci',
-            'p/postgresql',
-            'p/mysql'
+            'p/ci'
         ]
     }
 
@@ -428,64 +357,54 @@ class ChunkedScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with comprehensive configuration"""
         try:
+            """Execute Semgrep scan with comprehensive configuration"""
+        
             # Build base command
             cmd = [
             "semgrep",
             "scan",
             "--json",
             
-            # Core Security Rulesets
+            # Core Security Rulesets (verified available)
             "--config", "p/security-audit",
             "--config", "p/owasp-top-ten",
-            "--config", "p/ci",
-
-            # Language-specific Security
+            
+            # Language-specific rulesets (verified available)
             "--config", "p/javascript",
-            "--config", "p/python",
-            "--config", "p/java",
-            "--config", "p/csharp",
-            "--config", "p/golang",
-            "--config", "p/ruby",
-            "--config", "p/php",
+            "--config", "p/typescript",
+            "--config", "p/react",
+            "--config", "p/nodejs",
             
-            # Framework Security
-            "--config", "p/django",
-            "--config", "p/flask",
-            "--config", "p/spring",
-            "--config", "p/express",
-            "--config", "p/rails",
-            
-            # Infrastructure Security
-            "--config", "p/terraform",
-            "--config", "p/docker",
-            "--config", "p/kubernetes",
-            
-            # Specific Security Issues
-            "--config", "p/jwt",
+            # Security-specific rulesets (verified available)
             "--config", "p/secrets",
             "--config", "p/sql-injection",
             "--config", "p/xss",
-            "--config", "p/auth",
-            "--config", "p/crypto",
+            "--config", "p/jwt",
             
             # Performance Settings
             "--max-memory", "4000",
-            "--timeout", "900",  # 15 minutes
-            
-            # Scanning Options
+            "--timeout", "900",
             "--severity", "INFO",
             "--verbose",
             "--metrics=on"
             ]
 
+            # Only add language-specific rulesets for detected languages
+            language_ruleset_map = {
+                'javascript': ['p/javascript', 'p/nodejs', 'p/react'],
+                'typescript': ['p/typescript'],
+                'html': ['p/security-audit'],  # Basic security checks for HTML
+                'css': ['p/security-audit']    # Basic security checks for CSS
+            }
+
             # Add any detected language-specific rulesets
             for lang in self.detected_languages:
-                if lang in self.SEMGREP_RULESETS:
-                    for ruleset in self.SEMGREP_RULESETS[lang]:
-                        cmd.extend(["--config", ruleset])
-            
+                if lang in language_ruleset_map:
+                    for ruleset in language_ruleset_map[lang]:
+                        if ruleset not in cmd:  # Avoid duplicate rulesets
+                            cmd.extend(["--config", ruleset])
+
             # Add target directory
             cmd.append(str(target_dir))
 
