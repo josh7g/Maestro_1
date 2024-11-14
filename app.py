@@ -591,6 +591,8 @@ async def scan_repository():
             }), 400
 
         payload = request.get_json()
+        
+        # Required fields including user_id
         required_fields = ['owner', 'repo', 'installation_id', 'user_id']
         missing_fields = [field for field in required_fields if field not in payload]
         
@@ -603,10 +605,20 @@ async def scan_repository():
                 }
             }), 400
 
+        # Validate field values
         owner = str(payload['owner']).strip()
         repo = str(payload['repo']).strip()
         installation_id = str(payload['installation_id']).strip()
         user_id = str(payload['user_id']).strip()
+
+        if not all([owner, repo, installation_id, user_id]):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'All required fields must have non-empty values',
+                    'code': 'INVALID_FIELD_VALUES'
+                }
+            }), 400
 
         repo_name = f"{owner}/{repo}"
         repo_url = f"https://github.com/{repo_name}.git"
@@ -625,7 +637,7 @@ async def scan_repository():
                 }
             }), 401
 
-        # Create analysis record with pending status
+        # Create initial analysis record
         try:
             analysis = AnalysisResult(
                 repository_name=repo_name,
@@ -654,62 +666,111 @@ async def scan_repository():
             }), 500
 
         try:
-            # Configure scanner with memory limits
+            # Configure scanner for Render free tier
             config = ScanConfig(
-                max_memory_mb=2048,  # Limit to 2GB
-                max_total_size_gb=1,  # Limit repository size
-                timeout_seconds=1800  # 30 minutes timeout
+                max_file_size_mb=25,
+                max_total_size_mb=250,
+                max_memory_mb=450,
+                timeout_seconds=300,
+                file_timeout_seconds=30,
+                max_retries=2,
+                concurrent_processes=1
             )
             
-            # Run scan
-            scan_results = await scan_repository_handler(
-                repo_url=repo_url,
-                installation_token=installation_token,
-                user_id=user_id,
-                db_session=db.session
-            )
+            # Run scan with timeout
+            try:
+                scan_results = await asyncio.wait_for(
+                    scan_repository_handler(
+                        repo_url=repo_url,
+                        installation_token=installation_token,
+                        user_id=user_id,
+                        db_session=db.session
+                    ),
+                    timeout=300  # 5 minutes total timeout
+                )
+                
+                if not scan_results['success']:
+                    analysis.status = 'failed'
+                    analysis.error = str(scan_results.get('error', {}).get('message', 'Unknown error'))
+                    db.session.commit()
+                    
+                    return jsonify({
+                        'success': False,
+                        'error': scan_results.get('error', {
+                            'message': 'Scan failed',
+                            'code': 'SCAN_ERROR'
+                        })
+                    }), 500
 
-            if scan_results.get('success'):
+                # Update analysis record with results
                 analysis.status = 'completed'
                 analysis.results = scan_results.get('data')
                 analysis.error = None
-            else:
+                db.session.commit()
+                
+                logger.info(f"Updated analysis record {analysis.id} with scan results")
+
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'analysis_id': analysis.id,
+                        'repository': repo_name,
+                        'status': 'completed',
+                        'message': 'Analysis completed successfully',
+                        'metadata': {
+                            'timestamp': datetime.now().isoformat(),
+                            'duration_seconds': scan_results.get('data', {}).get('metadata', {}).get('scan_duration_seconds', 0)
+                        },
+                        'summary': {
+                            'total_findings': scan_results.get('data', {}).get('summary', {}).get('total_findings', 0),
+                            'files_scanned': scan_results.get('data', {}).get('summary', {}).get('files_scanned', 0),
+                            'severity_counts': scan_results.get('data', {}).get('summary', {}).get('severity_counts', {}),
+                            'category_counts': scan_results.get('data', {}).get('summary', {}).get('category_counts', {})
+                        }
+                    }
+                })
+
+            except asyncio.TimeoutError:
                 analysis.status = 'failed'
-                analysis.error = str(scan_results.get('error', {}).get('message', 'Unknown error'))
-                analysis.results = None
+                analysis.error = 'Scan timed out after 300 seconds'
+                db.session.commit()
+                
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Scan timed out',
+                        'code': 'SCAN_TIMEOUT',
+                        'details': 'Repository scan exceeded time limit on Render free tier'
+                    }
+                }), 504
 
-            db.session.commit()
-            logger.info(f"Updated analysis record {analysis.id} with status {analysis.status}")
+            except Exception as scan_error:
+                analysis.status = 'failed'
+                analysis.error = str(scan_error)
+                db.session.commit()
+                
+                logger.error(f"Scan execution error: {str(scan_error)}")
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Scan execution failed',
+                        'code': 'SCAN_EXECUTION_ERROR',
+                        'details': str(scan_error)
+                    }
+                }), 500
 
-            # Return enhanced response
-            return jsonify({
-                'success': scan_results.get('success', False),
-                'data': {
-                    'analysis_id': analysis.id,
-                    'repository': repo_name,
-                    'status': analysis.status,
-                    'message': 'Analysis completed' if scan_results.get('success') else 'Analysis failed',
-                    'metadata': scan_results.get('data', {}).get('metadata', {}),
-                    'summary': scan_results.get('data', {}).get('summary', {})
-                } if scan_results.get('success') else None,
-                'error': scan_results.get('error')
-            })
-
-        except Exception as scan_error:
-            logger.error(f"Scan error: {str(scan_error)}")
-            logger.error(traceback.format_exc())
-            
-            # Update analysis record with error
+        except Exception as e:
             analysis.status = 'failed'
-            analysis.error = str(scan_error)
+            analysis.error = str(e)
             db.session.commit()
             
+            logger.error(f"Scan configuration error: {str(e)}")
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Scan execution failed',
-                    'code': 'SCAN_ERROR',
-                    'details': str(scan_error)
+                    'message': 'Scan configuration failed',
+                    'code': 'CONFIGURATION_ERROR',
+                    'details': str(e)
                 }
             }), 500
 

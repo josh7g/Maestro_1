@@ -23,11 +23,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ScanConfig:
     """Render-optimized scanning configuration"""
-    max_file_size_mb: int = 25         # Individual file size limit
-    max_total_size_mb: int = 250       # Total repository size limit
-    max_memory_mb: int = 450           # Leave some headroom from 512MB
-    timeout_seconds: int = 300         # 5 minutes total
-    file_timeout_seconds: int = 30     # 30 seconds per file
+    max_file_size_mb: int = 25
+    max_total_size_mb: int = 250     # Changed from max_total_size_gb
+    max_memory_mb: int = 450
+    
+    # Timeouts
+    timeout_seconds: int = 300
+    file_timeout_seconds: int = 30
+    max_retries: int = 2
+    
+    # Process limits
+    concurrent_processes: int = 1
     exclude_patterns: List[str] = field(default_factory=lambda: [
         # Version Control
         '.git',
