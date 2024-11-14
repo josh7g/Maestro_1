@@ -5,7 +5,7 @@ from collections import defaultdict
 import os
 import logging
 from pathlib import Path
-from github import Github, git_integration 
+from github import Github, Git_integration 
 import logging
 
 logging.basicConfig(
@@ -70,7 +70,7 @@ def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
             'error': {'message': 'Missing installation_id parameter'}
         }), 400
 
-    return get_file_content(owner, repo, user_id, installation_id, filename,git_integration)
+    return get_file_content(owner, repo, user_id, installation_id, filename,Git_integration)
 
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
 def get_repo_results(owner, repo):
