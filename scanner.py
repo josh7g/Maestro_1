@@ -7,11 +7,12 @@ import tempfile
 import shutil
 import asyncio
 import git
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from sqlalchemy.orm import Session
+from models import AnalysisResult
 
 # Configure logging
 logging.basicConfig(
@@ -26,12 +27,10 @@ class ScanConfig:
     """Configuration for repository scanning"""
     max_file_size_mb: int = 100
     max_total_size_gb: int = 5
-    max_memory_percent: int = 90
+    max_memory_mb: int = 2048
     timeout_seconds: int = 3600
     max_retries: int = 3
-    concurrent_processes: int = 1
     exclude_patterns: List[str] = field(default_factory=lambda: [
-        # Basic exclusions that won't interfere with scanning
         '.git',
         'node_modules',
         'venv',
@@ -40,22 +39,22 @@ class ScanConfig:
         '.pytest_cache'
     ])
 
-class ChunkedScanner:
-    """Enhanced scanner implementation for multi-language analysis"""
+class SecurityScanner:
+    """Enhanced security scanner implementation"""
     
     def __init__(self, config: ScanConfig = ScanConfig(), db_session: Optional[Session] = None):
         self.config = config
         self.db_session = db_session
         self.temp_dir = None
         self.repo_dir = None
-        self.detected_languages = set()
         self.scan_stats = {
             'start_time': None,
             'end_time': None,
             'total_files': 0,
             'files_processed': 0,
             'findings_count': 0,
-            'languages_detected': set()
+            'excluded_files': 0,
+            'skipped_files': 0
         }
 
     async def __aenter__(self):
@@ -80,6 +79,7 @@ class ChunkedScanner:
                 self.scan_stats['end_time'] = datetime.now()
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
+
     async def _clone_repository(self, repo_url: str, token: str) -> Path:
         """Clone repository with authentication"""
         try:
@@ -88,7 +88,7 @@ class ChunkedScanner:
 
             logger.info(f"Cloning repository to {self.repo_dir}")
             
-            # Minimal git options to ensure complete repository access
+            # Basic git options
             git_options = [
                 '--single-branch',
                 '--no-tags'
@@ -122,22 +122,22 @@ class ChunkedScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute Semgrep scan with comprehensive configuration"""
+        """Execute Semgrep scan with memory optimization"""
         try:
-            # Build command to match CLI behavior
             cmd = [
                 "semgrep",
                 "scan",
-                "--config", "auto",  # Use auto config like CLI
+                "--config", "auto",
                 "--json",
                 "--verbose",
                 "--metrics=on",
                 
-                # Performance settings
-                "--timeout", "300",  # 5 minutes per rule
-                "--timeout-threshold", "3",  # Skip file after 3 timeouts
+                # Memory optimization settings
+                f"--max-memory", str(self.config.max_memory_mb),
+                "--jobs", "1",
+                "--timeout", "300",
+                "--timeout-threshold", "3",
                 
-                # Target directory
                 str(target_dir)
             ]
 
@@ -148,8 +148,15 @@ class ChunkedScanner:
                 cwd=str(target_dir)
             )
 
-            stdout, stderr = await process.communicate()
-            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                raise TimeoutError("Semgrep scan timed out")
+
             stderr_output = stderr.decode() if stderr else ""
             if stderr_output:
                 logger.warning(f"Semgrep stderr: {stderr_output}")
@@ -158,18 +165,15 @@ class ChunkedScanner:
             if not output.strip():
                 return self._create_empty_result()
 
-            # Parse and enhance results
             results = json.loads(output)
-            enhanced_results = self._process_scan_results(results)
-            
-            return enhanced_results
+            return self._process_scan_results(results)
 
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
             return self._create_empty_result(error=str(e))
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process and enhance scan results"""
+        """Process scan results"""
         findings = results.get('results', [])
         
         processed_findings = []
@@ -186,12 +190,7 @@ class ChunkedScanner:
                 'message': finding.get('extra', {}).get('message', ''),
                 'severity': finding.get('extra', {}).get('severity', 'INFO'),
                 'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
-                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                'fix_recommendations': {
-                    'description': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
-                    'references': finding.get('extra', {}).get('metadata', {}).get('fix_references', [])
-                }
+                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', '')
             }
             
             severity = enhanced_finding['severity']
@@ -229,6 +228,7 @@ class ChunkedScanner:
             },
             'errors': [error] if error else []
         }
+
     async def scan_repository(
         self,
         repo_url: str,
@@ -241,9 +241,7 @@ class ChunkedScanner:
         try:
             # Clone and scan repository
             repo_path = await self._clone_repository(repo_url, token)
-            repo_size = os.path.getsize(repo_path) / (1024 * 1024)  # Size in MB
-            
-            logger.info(f"Starting scan of repository ({repo_size:.2f} MB)")
+            logger.info(f"Starting scan of repository")
             
             # Run semgrep scan
             scan_results = await self._run_semgrep_scan(repo_path)
@@ -259,59 +257,43 @@ class ChunkedScanner:
                         'repo': repo_url.split('github.com/')[-1].split('/')[1].replace('.git', '')
                     },
                     'metadata': {
-                        'semgrep_version': '1.96.0',  # You might want to get this dynamically
                         'status': 'completed',
                         'timestamp': scan_start_time.isoformat(),
                         'completion_timestamp': datetime.now().isoformat(),
                         'scan_duration_seconds': scan_duration,
-                        'repository_size_mb': round(repo_size, 2),
                         'performance_metrics': {
                             'total_duration_seconds': scan_duration,
-                            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024),
-                            'files_analyzed': scan_results.get('stats', {}).get('files_scanned', 0),
-                            'files_ignored': scan_results.get('stats', {}).get('files_skipped', 0)
+                            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
                         }
                     },
                     'summary': {
-                        'files_scanned': scan_results.get('stats', {}).get('files_scanned', 0),
-                        'scan_status': 'completed_with_errors' if scan_results.get('errors') else 'completed',
-                        'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
-                        'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
-                        'category_counts': scan_results.get('stats', {}).get('category_counts', {})
+                        'total_findings': scan_results['stats']['total_findings'],
+                        'severity_counts': scan_results['stats']['severity_counts'],
+                        'category_counts': scan_results['stats']['category_counts'],
+                        'files_scanned': scan_results['stats']['files_scanned'],
+                        'files_skipped': scan_results['stats']['files_skipped']
                     },
-                    'findings': scan_results.get('findings', []),
-                    'errors': scan_results.get('errors', []),
-                    'filters': {
-                        'available_severities': ['HIGH', 'MEDIUM', 'LOW', 'INFO'],
-                        'available_categories': list(set(finding.get('category', 'unknown') 
-                                                      for finding in scan_results.get('findings', [])))
-                    },
-                    'pagination': {
-                        'current_page': 1,
-                        'per_page': 10,
-                        'total_items': len(scan_results.get('findings', [])),
-                        'total_pages': (len(scan_results.get('findings', [])) + 9) // 10
-                    }
+                    'findings': scan_results['findings'],
+                    'errors': scan_results['errors']
                 }
             }
 
-            # Update database if session provided
+            # Update database
             if self.db_session is not None and user_id is not None:
                 try:
-                    from models import ScanResult
-                    
-                    scan_record = ScanResult(
+                    analysis = AnalysisResult(
+                        repository_name=response['data']['repository']['name'],
                         user_id=user_id,
-                        repository_url=repo_url,
-                        findings_count=response['data']['summary']['total_findings'],
-                        results=response['data']
+                        status='completed',
+                        results=response['data'],
+                        error=None if response['success'] else str(scan_results.get('errors', []))
                     )
                     
-                    self.db_session.add(scan_record)
+                    self.db_session.add(analysis)
                     self.db_session.commit()
                     
-                    response['data']['scan_id'] = scan_record.id
-                    logger.info(f"Scan record {scan_record.id} created successfully")
+                    response['data']['analysis_id'] = analysis.id
+                    logger.info(f"Analysis record {analysis.id} created successfully")
                     
                 except Exception as db_error:
                     logger.error(f"Database error: {str(db_error)}")
@@ -351,7 +333,7 @@ async def scan_repository_handler(
     try:
         config = ScanConfig()
         
-        async with ChunkedScanner(config, db_session) as scanner:
+        async with SecurityScanner(config, db_session) as scanner:
             results = await scanner.scan_repository(
                 repo_url,
                 installation_token,

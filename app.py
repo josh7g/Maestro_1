@@ -591,8 +591,6 @@ async def scan_repository():
             }), 400
 
         payload = request.get_json()
-        
-        # Required fields including user_id
         required_fields = ['owner', 'repo', 'installation_id', 'user_id']
         missing_fields = [field for field in required_fields if field not in payload]
         
@@ -605,33 +603,15 @@ async def scan_repository():
                 }
             }), 400
 
-        # Validate field values
         owner = str(payload['owner']).strip()
         repo = str(payload['repo']).strip()
         installation_id = str(payload['installation_id']).strip()
         user_id = str(payload['user_id']).strip()
 
-        # Additional validation
-        if not all([owner, repo, installation_id, user_id]):
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'All required fields must have non-empty values',
-                    'code': 'INVALID_FIELD_VALUES',
-                    'details': {
-                        'owner': bool(owner),
-                        'repo': bool(repo),
-                        'installation_id': bool(installation_id),
-                        'user_id': bool(user_id)
-                    }
-                }
-            }), 400
-
         repo_name = f"{owner}/{repo}"
         repo_url = f"https://github.com/{repo_name}.git"
 
         try:
-            # Verify the installation token
             installation_token = git_integration.get_access_token(
                 int(installation_id)
             ).token
@@ -645,79 +625,96 @@ async def scan_repository():
                 }
             }), 401
 
-        # Create database entry
+        # Create analysis record with pending status
         try:
             analysis = AnalysisResult(
                 repository_name=repo_name,
                 user_id=user_id,
-                status='in_progress'
+                status='pending',
+                results=None,
+                error=None
             )
             db.session.add(analysis)
             db.session.commit()
-            logger.info(f"Created analysis record for user {user_id}, repository {repo_name}")
-        except Exception as e:
-            logger.error(f"Database error creating analysis record: {str(e)}")
+            logger.info(f"Created analysis record {analysis.id} for {repo_name}")
+
+            # Update to in_progress after creation
+            analysis.status = 'in_progress'
+            db.session.commit()
+            
+        except Exception as db_error:
+            logger.error(f"Database error: {str(db_error)}")
             return jsonify({
                 'success': False,
                 'error': {
                     'message': 'Failed to create analysis record',
                     'code': 'DATABASE_ERROR',
-                    'details': str(e)
+                    'details': str(db_error)
                 }
             }), 500
 
-        # Run the enhanced scanner
         try:
+            # Configure scanner with memory limits
+            config = ScanConfig(
+                max_memory_mb=2048,  # Limit to 2GB
+                max_total_size_gb=1,  # Limit repository size
+                timeout_seconds=1800  # 30 minutes timeout
+            )
+            
+            # Run scan
             scan_results = await scan_repository_handler(
                 repo_url=repo_url,
                 installation_token=installation_token,
                 user_id=user_id,
-                db_session=db.session,
-        
+                db_session=db.session
             )
-            
-            # Update database with results
-            if scan_results['success']:
+
+            if scan_results.get('success'):
                 analysis.status = 'completed'
-                analysis.results = scan_results['data']
+                analysis.results = scan_results.get('data')
+                analysis.error = None
             else:
                 analysis.status = 'failed'
-                analysis.error = scan_results['error']['message']
+                analysis.error = str(scan_results.get('error', {}).get('message', 'Unknown error'))
+                analysis.results = None
 
             db.session.commit()
             logger.info(f"Updated analysis record {analysis.id} with status {analysis.status}")
 
             # Return enhanced response
             return jsonify({
-                'success': scan_results['success'],
+                'success': scan_results.get('success', False),
                 'data': {
-                    'message': 'Analysis completed' if scan_results['success'] else 'Analysis failed',
-                    'repository': repo_name,
-                    'user_id': user_id,
                     'analysis_id': analysis.id,
+                    'repository': repo_name,
                     'status': analysis.status,
-                    'metadata': scan_results['data'].get('metadata', {}),
-                    'stats': scan_results['data'].get('processed_results', {}).get('stats', {})
-                }
+                    'message': 'Analysis completed' if scan_results.get('success') else 'Analysis failed',
+                    'metadata': scan_results.get('data', {}).get('metadata', {}),
+                    'summary': scan_results.get('data', {}).get('summary', {})
+                } if scan_results.get('success') else None,
+                'error': scan_results.get('error')
             })
 
-        except Exception as e:
+        except Exception as scan_error:
+            logger.error(f"Scan error: {str(scan_error)}")
+            logger.error(traceback.format_exc())
+            
+            # Update analysis record with error
             analysis.status = 'failed'
-            analysis.error = str(e)
+            analysis.error = str(scan_error)
             db.session.commit()
             
-            logger.error(f"Scan failed for {repo_name}: {str(e)}")
             return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Scan failed',
+                    'message': 'Scan execution failed',
                     'code': 'SCAN_ERROR',
-                    'details': str(e)
+                    'details': str(scan_error)
                 }
             }), 500
 
     except Exception as e:
-        logger.error(f"Scan endpoint error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
             'success': False,
