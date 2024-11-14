@@ -563,7 +563,7 @@ def format_finding(finding: Dict) -> Dict:
         'references': finding.get('references', [])
     }
 
-@analysis_bp.route('/<owner>/<repo>/findings', methods=['GET'])
+@analysis_bp.route('/<owner>/<repo>/result', methods=['GET'])
 def get_analysis_findings(owner: str, repo: str):
     """Get detailed findings with filtering and pagination"""
     try:
