@@ -432,55 +432,52 @@ class ChunkedScanner:
         try:
             # Build base command
             cmd = [
-                "semgrep",
-                "scan",
-                "--json",
-                
-                # Core Security Rulesets
-                "--config", "p/security-audit",
-                "--config", "p/owasp-top-ten",
-                "--config", "p/ci",
-                
-                # Language-specific Security
-                "--config", "p/javascript",
-                "--config", "p/python",
-                "--config", "p/java",
-                "--config", "p/csharp",
-                "--config", "p/golang",
-                "--config", "p/ruby",
-                "--config", "p/php",
-                
-                # Framework Security
-                "--config", "p/django",
-                "--config", "p/flask",
-                "--config", "p/spring",
-                "--config", "p/express",
-                "--config", "p/rails",
-                
-                # Infrastructure Security
-                "--config", "p/terraform",
-                "--config", "p/docker",
-                "--config", "p/kubernetes",
-                
-                # Specific Security Issues
-                "--config", "p/jwt",
-                "--config", "p/secrets",
-                "--config", "p/sql-injection",
-                "--config", "p/xss",
-                "--config", "p/auth",
-                "--config", "p/crypto",
-                
-                # Performance Settings
-                "--max-memory", "4000",
-                "--timeout", "900",  # 15 minutes
-                "--severity", "INFO",
-                
-                # Enhanced Scanning
-                "--enable-nosem",
-                "--enable-git-ignore",
-                "--verbose",
-                "--metrics=on",
-                "--no-git-ignore-version-check"
+            "semgrep",
+            "scan",
+            "--json",
+            
+            # Core Security Rulesets
+            "--config", "p/security-audit",
+            "--config", "p/owasp-top-ten",
+            "--config", "p/ci",
+
+            # Language-specific Security
+            "--config", "p/javascript",
+            "--config", "p/python",
+            "--config", "p/java",
+            "--config", "p/csharp",
+            "--config", "p/golang",
+            "--config", "p/ruby",
+            "--config", "p/php",
+            
+            # Framework Security
+            "--config", "p/django",
+            "--config", "p/flask",
+            "--config", "p/spring",
+            "--config", "p/express",
+            "--config", "p/rails",
+            
+            # Infrastructure Security
+            "--config", "p/terraform",
+            "--config", "p/docker",
+            "--config", "p/kubernetes",
+            
+            # Specific Security Issues
+            "--config", "p/jwt",
+            "--config", "p/secrets",
+            "--config", "p/sql-injection",
+            "--config", "p/xss",
+            "--config", "p/auth",
+            "--config", "p/crypto",
+            
+            # Performance Settings
+            "--max-memory", "4000",
+            "--timeout", "900",  # 15 minutes
+            
+            # Scanning Options
+            "--severity", "INFO",
+            "--verbose",
+            "--metrics=on"
             ]
 
             # Add any detected language-specific rulesets
