@@ -12,7 +12,7 @@ class AnalysisResult(db.Model):
     user_id = db.Column(db.String(255), nullable=True, index=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(50))
-    results = db.Column(db.JSON)
+    results = db.Column(JSON)
     error = db.Column(db.Text)
     
     def to_dict(self):

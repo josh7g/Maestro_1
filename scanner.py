@@ -56,7 +56,9 @@ class SecurityScanner:
             'excluded_files': 0,
             'skipped_files': 0
         }
-
+    class SecurityScanner:
+        """Enhanced security scanner implementation"""
+    
     async def __aenter__(self):
         await self._setup()
         return self
