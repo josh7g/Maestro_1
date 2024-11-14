@@ -5,8 +5,6 @@ from collections import defaultdict
 import os
 import logging
 from pathlib import Path
-import tempfile
-from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,42 +154,47 @@ def get_file_content(owner: str, repo: str, user_id: str, filename: str):
     try:
         repository = f"{owner}/{repo}"
         
-        # Find the most recent repo directory
-        base_dir = Path(tempfile.gettempdir())
-        repo_dirs = list(base_dir.glob("scanner_*/repo_*"))
-        if not repo_dirs:
-            return jsonify({
-                'success': False,
-                'error': {'message': 'Repository not found'}
-            }), 404
-            
-        repo_dir = sorted(repo_dirs, key=lambda x: x.stat().st_mtime)[-1]
-        file_path = repo_dir / filename
-        
-        # Security check
-        if not str(file_path).startswith(str(repo_dir)):
-            return jsonify({
-                'success': False,
-                'error': {'message': 'Invalid file path'}
-            }), 400
-            
-        if not file_path.exists():
-            return jsonify({
-                'success': False,
-                'error': {'message': 'File not found'}
-            }), 404
-            
-        with open(file_path, 'r') as f:
-            file_content = f.read()
-            
-        # Get version from analysis results
+        # Get the latest analysis result for this repository
         result = AnalysisResult.query.filter_by(
             user_id=user_id,
             repository_name=repository
         ).order_by(desc(AnalysisResult.timestamp)).first()
         
+        if not result:
+            return jsonify({
+                'success': False,
+                'error': {'message': 'No analysis results found'}
+            }), 404
+            
+        # Find the file in the findings
+        findings = result.results.get('findings', [])
+        target_file = None
+        
+        for finding in findings:
+            if finding.get('file', '').endswith(filename):
+                target_file = finding.get('file')
+                break
+                
+        if not target_file:
+            return jsonify({
+                'success': False,
+                'error': {'message': f'File {filename} not found in analysis results'}
+            }), 404
+            
+        # Get absolute path from finding
+        file_path = Path(target_file)
+        
+        if not file_path.exists():
+            return jsonify({
+                'success': False,
+                'error': {'message': 'File no longer exists on disk'}
+            }), 404
+            
+        with open(file_path, 'r') as f:
+            file_content = f.read()
+            
         version = "1.0"
-        if result and result.results.get('metadata', {}).get('version'):
+        if result.results.get('metadata', {}).get('version'):
             version = result.results['metadata']['version']
             
         return jsonify({
