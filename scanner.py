@@ -271,23 +271,30 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results with memory tracking and enhanced categorization"""
+        """Process scan results with enhanced metrics"""
         findings = results.get('results', [])
+        stats = results.get('stats', {})
         
         processed_findings = []
-        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
+        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0, 'WARNING': 0, 'ERROR': 0}
         category_counts = {}
         
+        # Track unique files scanned
+        files_scanned = set()
+        
         for finding in findings:
-            # Monitor memory usage during processing
             current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
             if current_memory > self.config.max_memory_mb:
                 logger.warning("Memory limit reached during result processing")
                 break
 
+            file_path = finding.get('path', '')
+            if file_path:
+                files_scanned.add(file_path)
+
             enhanced_finding = {
                 'id': finding.get('check_id'),
-                'file': finding.get('path'),
+                'file': file_path,
                 'line_start': finding.get('start', {}).get('line'),
                 'line_end': finding.get('end', {}).get('line'),
                 'code_snippet': finding.get('extra', {}).get('lines', ''),
@@ -309,13 +316,20 @@ class SecurityScanner:
             processed_findings.append(enhanced_finding)
             self.scan_stats['findings_count'] += 1
 
+            self.scan_stats['files_processed'] = len(files_scanned)
+        
         return {
             'findings': processed_findings,
             'stats': {
                 'total_findings': len(processed_findings),
                 'severity_counts': severity_counts,
                 'category_counts': category_counts,
-                'scan_stats': self.scan_stats,
+                'scan_stats': {
+                    **self.scan_stats,
+                    'total_files_scanned': len(files_scanned),
+                    'files_with_findings': len(files_scanned),
+                    'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds()
+                },
                 'memory_usage_mb': self.scan_stats['memory_usage_mb']
             }
         }
@@ -384,7 +398,7 @@ async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
     user_id: str,
-    db_session: Optional[Session] = None
+    db_session: Optional[Session] =None
 ) -> Dict:
     """Handler function for web routes with input validation"""
     logger.info(f"Starting scan request for repository: {repo_url}")
@@ -525,6 +539,135 @@ def sort_findings_by_severity(findings: List[Dict]) -> List[Dict]:
         reverse=True
     )
 
+from flask import Blueprint, request, jsonify
+from datetime import datetime
+from typing import Dict, List, Optional
+from sqlalchemy import desc
+
+analysis_bp = Blueprint('analysis', __name__, url_prefix='/api/v1/analysis')
+
+def format_finding(finding: Dict) -> Dict:
+    """Format a single finding for API response"""
+    return {
+        'id': finding.get('id'),
+        'file': finding.get('file'),
+        'line_start': finding.get('line_start'),
+        'line_end': finding.get('line_end'),
+        'severity': finding.get('severity', 'UNKNOWN'),
+        'category': finding.get('category', 'unknown'),
+        'message': finding.get('message'),
+        'code_snippet': finding.get('code_snippet'),
+        'cwe': finding.get('cwe', []),
+        'owasp': finding.get('owasp', []),
+        'fix_recommendations': finding.get('fix_recommendations'),
+        'references': finding.get('references', [])
+    }
+
+@analysis_bp.route('/<owner>/<repo>/findings', methods=['GET'])
+def get_analysis_findings(owner: str, repo: str):
+    """Get detailed findings with filtering and pagination"""
+    try:
+        # Get query parameters
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(100, max(1, int(request.args.get('limit', 10))))
+        severity = request.args.get('severity', '').upper()
+        category = request.args.get('category', '')
+        file_path = request.args.get('file', '')
+        
+        repo_name = f"{owner}/{repo}"
+        
+        # Get latest analysis result
+        result = AnalysisResult.query.filter_by(
+            repository_name=repo_name
+        ).order_by(
+            desc(AnalysisResult.timestamp)
+        ).first()
+        
+        if not result:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'No analysis found',
+                    'code': 'ANALYSIS_NOT_FOUND'
+                }
+            }), 404
+
+        # Extract findings
+        findings = result.results.get('findings', [])
+        
+        # Apply filters
+        if severity:
+            findings = [f for f in findings if f.get('severity', '').upper() == severity]
+        if category:
+            findings = [f for f in findings if f.get('category', '').lower() == category.lower()]
+        if file_path:
+            findings = [f for f in findings if file_path in f.get('file', '')]
+        
+        # Get total count before pagination
+        total_findings = len(findings)
+        
+        # Apply pagination
+        start_idx = (page - 1) * per_page
+        end_idx = start_idx + per_page
+        paginated_findings = findings[start_idx:end_idx]
+        
+        # Get unique values for filters
+        all_severities = sorted(set(f.get('severity', '').upper() for f in findings))
+        all_categories = sorted(set(f.get('category', '').lower() for f in findings))
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'repository': {
+                    'name': repo_name,
+                    'owner': owner,
+                    'repo': repo
+                },
+                'metadata': {
+                    'analysis_id': result.id,
+                    'timestamp': result.timestamp.isoformat(),
+                    'status': result.status,
+                    'duration_seconds': result.results.get('stats', {}).get('scan_stats', {}).get('scan_duration')
+                },
+                'summary': {
+                    'files_scanned': result.results.get('stats', {}).get('scan_stats', {}).get('total_files_scanned', 0),
+                    'total_findings': total_findings,
+                    'severity_counts': result.results.get('stats', {}).get('severity_counts', {}),
+                    'category_counts': result.results.get('stats', {}).get('category_counts', {})
+                },
+                'findings': [format_finding(f) for f in paginated_findings],
+                'pagination': {
+                    'current_page': page,
+                    'total_pages': (total_findings + per_page - 1) // per_page,
+                    'total_items': total_findings,
+                    'per_page': per_page
+                },
+                'filters': {
+                    'available_severities': all_severities,
+                    'available_categories': all_categories,
+                }
+            }
+        })
+        
+    except ValueError as ve:
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': str(ve),
+                'code': 'INVALID_PARAMETER'
+            }
+        }), 400
+        
+    except Exception as e:
+        logger.error(f"Error getting findings: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {
+                'message': 'Internal server error',
+                'code': 'INTERNAL_ERROR'
+            }
+        }), 500
+    
 
 if __name__ == '__main__':
     # Example usage for command-line testing
