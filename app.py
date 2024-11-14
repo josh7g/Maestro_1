@@ -20,6 +20,7 @@ import requests
 from flask_cors import CORS
 from asgiref.wsgi import WsgiToAsgi
 from scanner import SecurityScanner, ScanConfig, scan_repository_handler
+from api import api
 
 # Load environment variables in development
 if os.getenv('FLASK_ENV') != 'production':
@@ -54,6 +55,8 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize database
 db.init_app(app)
+
+app.register_blueprint(api)
 
 # Initialize database and run migrations
 with app.app_context():
