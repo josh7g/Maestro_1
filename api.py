@@ -138,3 +138,63 @@ def get_top_vulnerabilities(user_id):
             'success': False,
             'error': {'message': str(e)}
         }), 500
+@api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
+def get_file_content(owner: str, repo: str, user_id: str, filename: str):
+    try:
+        repository = f"{owner}/{repo}"
+        
+        # Get latest analysis result for version info
+        result = AnalysisResult.query.filter_by(
+            user_id=user_id,
+            repository_name=repository
+        ).order_by(desc(AnalysisResult.timestamp)).first()
+        
+        # Get the repository path
+        repo_dir = Path(config.REPOS_DIR) / user_id / repository
+        
+        if not repo_dir.exists():
+            return jsonify({
+                'success': False,
+                'error': {'message': 'Repository not found'}
+            }), 404
+        
+        file_path = repo_dir / filename
+        
+        # Security check - ensure file is within repo directory
+        if not str(file_path).startswith(str(repo_dir)):
+            return jsonify({
+                'success': False,
+                'error': {'message': 'Invalid file path'}
+            }), 400
+            
+        if not file_path.exists():
+            return jsonify({
+                'success': False,
+                'error': {'message': 'File not found'}
+            }), 404
+            
+        with open(file_path, 'r') as f:
+            file_content = f.read()
+            
+        # Get version from analysis results, default to "1.0"
+        version = "1.0"
+        if result and result.results.get('metadata', {}).get('version'):
+            version = result.results['metadata']['version']
+            
+        return jsonify({
+            'success': True,
+            'data': {
+                'file': file_content,
+                'user_id': user_id,
+                'version': version,
+                'reponame': repository,
+                'filename': filename
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error reading file content: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {'message': str(e)}
+        }), 500
