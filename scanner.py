@@ -24,30 +24,125 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
-    """Configuration settings for security scanning"""
-    max_file_size_mb: int = 50
-    max_total_size_mb: int = 300  # Lower to prevent memory issues
-    max_memory_mb: int = 1500  # Leave 500MB for system/other processes
+    """Configuration optimized for Render (2GB RAM, 1 CPU)"""
+    max_file_size_mb: int = 25
+    max_total_size_mb: int = 300
+    max_memory_mb: int = 1500
+    chunk_size_mb: int = 50  # New: Process repository in chunks
     
-    timeout_seconds: int = 900  # 15 minutes total
-    file_timeout_seconds: int = 45
+    timeout_seconds: int = 1200  # 20 minutes total
+    file_timeout_seconds: int = 30
     max_retries: int = 2
-    
-    # Single process due to 1 CPU
     concurrent_processes: int = 1
 
-    # Added more exclusions to reduce processing
     exclude_patterns: List[str] = field(default_factory=lambda: [
-        '.git', '.svn', 'node_modules', 'vendor',
-        'bower_components', 'packages', 'dist',
-        'build', 'out', 'venv', '.env', '__pycache__',
-        '*.min.js', '*.min.css', '*.bundle.js',
-        '*.bundle.css', '*.map', '*.pdf', '*.jpg',
-        '*.jpeg', '*.png', '*.gif', '*.zip', '*.tar',
-        '*.gz', '*.rar', '*.mp4', '*.mov', '*.lock',
-        'package-lock.json', 'yarn.lock',
-        'coverage', 'tests', 'test', 'docs'
+        # Version Control
+        '.git', '.svn',
+        
+        # Dependencies
+        'node_modules', 'vendor', 'bower_components',
+        'packages', '*.lock', 'package-lock.json',
+        
+        # Build/Test
+        'dist', 'build', 'out', 'coverage', 
+        'tests', 'test', '__tests__',
+        
+        # Environment
+        'venv', '.env', '__pycache__', '.vscode',
+        
+        # Assets
+        '*.min.js', '*.min.css', '*.bundle.*',
+        '*.map', '*.pdf', '*.jpg', '*.jpeg',
+        '*.png', '*.gif', '*.zip', '*.tar',
+        '*.gz', '*.rar', '*.mp4', '*.mov',
+        
+        # Documentation
+        'docs', 'README.md', 'CHANGELOG.md'
     ])
+
+async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+    """Execute chunked semgrep scan"""
+    all_results = []
+    current_chunk = []
+    current_chunk_size = 0
+    
+    # Get all scannable files
+    for root, _, files in os.walk(target_dir):
+        for file in files:
+            if any(fnmatch.fnmatch(file, pattern) for pattern in self.config.exclude_patterns):
+                continue
+                
+            file_path = Path(root) / file
+            file_size = file_path.stat().st_size / (1024 * 1024)  # MB
+            
+            if file_size > self.config.max_file_size_mb:
+                continue
+                
+            if current_chunk_size + file_size > self.config.chunk_size_mb:
+                # Scan current chunk
+                chunk_results = await self._scan_chunk(current_chunk)
+                all_results.extend(chunk_results)
+                current_chunk = []
+                current_chunk_size = 0
+                
+            current_chunk.append(str(file_path))
+            current_chunk_size += file_size
+    
+    # Scan final chunk
+    if current_chunk:
+        chunk_results = await self._scan_chunk(current_chunk)
+        all_results.extend(chunk_results)
+    
+    return self._merge_results(all_results)
+
+async def _scan_chunk(self, files: List[str]) -> List[Dict]:
+    """Scan a chunk of files"""
+    cmd = [
+        "semgrep",
+        "scan",
+        "--config", "auto",
+        "--json",
+        "--metrics=off",
+        f"--max-memory={self.config.max_memory_mb}",
+        "--jobs=1",
+        f"--timeout={self.config.file_timeout_seconds}",
+        "--optimizations=all"
+    ] + files
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    try:
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(),
+            timeout=self.config.timeout_seconds
+        )
+        return json.loads(stdout.decode()).get('results', [])
+    except Exception as e:
+        logger.warning(f"Chunk scan error: {str(e)}")
+        return []
+
+def _merge_results(self, chunk_results: List[List[Dict]]) -> Dict:
+    """Merge results from all chunks"""
+    merged_findings = []
+    severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
+    
+    for findings in chunk_results:
+        for finding in findings:
+            severity = finding.get('extra', {}).get('severity', 'INFO').upper()
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            merged_findings.append(finding)
+    
+    return {
+        'results': merged_findings,
+        'stats': {
+            'total_findings': len(merged_findings),
+            'severity_counts': severity_counts
+        }
+    }
 
 class SecurityScanner:
     """Security scanner optimized for resource-constrained environments"""
