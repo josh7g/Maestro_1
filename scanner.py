@@ -405,48 +405,48 @@ class SecurityScanner:
             logger.error(f"Error in _process_scan_results: {str(e)}")
             return self._create_empty_result(error=str(e))
 
-async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
-    """Updated main method to ensure file stats are properly passed through"""
-    try:
-        # Clone the repository
-        repo_dir = await self._clone_repository(repo_url, installation_token)
+    async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
         
-        # Run the semgrep scan
-        scan_results = await self._run_semgrep_scan(repo_dir)
-        
-        return {
-            'success': True,
-            'data': {
-                'repository': repo_url,
-                'user_id': user_id,
-                'timestamp': datetime.now().isoformat(),
-                'findings': scan_results.get('findings', []),
-                'summary': {
-                    'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
-                    'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
-                    'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
-                    'files_scanned': scan_results.get('stats', {}).get('file_stats', {}).get('files_scanned', 0),
-                },
-                'metadata': {
-                    'scan_duration_seconds': (
-                        datetime.now() - self.scan_stats['start_time']
-                    ).total_seconds() if self.scan_stats['start_time'] else 0,
-                    'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
+        try:
+            # Clone the repository
+            repo_dir = await self._clone_repository(repo_url, installation_token)
+            
+            # Run the semgrep scan
+            scan_results = await self._run_semgrep_scan(repo_dir)
+            
+            return {
+                'success': True,
+                'data': {
+                    'repository': repo_url,
+                    'user_id': user_id,
+                    'timestamp': datetime.now().isoformat(),
+                    'findings': scan_results.get('findings', []),
+                    'summary': {
+                        'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
+                        'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
+                        'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
+                        'files_scanned': scan_results.get('stats', {}).get('file_stats', {}).get('files_scanned', 0),
+                    },
+                    'metadata': {
+                        'scan_duration_seconds': (
+                            datetime.now() - self.scan_stats['start_time']
+                        ).total_seconds() if self.scan_stats['start_time'] else 0,
+                        'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
+                    }
                 }
             }
-        }
-            
-    except Exception as e:
-        logger.error(f"Scan repository error: {str(e)}")
-        return {
-            'success': False,
-            'error': {
-                'message': str(e),
-                'code': 'SCAN_ERROR',
-                'type': type(e).__name__,
-                'timestamp': datetime.now().isoformat()
+                
+        except Exception as e:
+            logger.error(f"Scan repository error: {str(e)}")
+            return {
+                'success': False,
+                'error': {
+                    'message': str(e),
+                    'code': 'SCAN_ERROR',
+                    'type': type(e).__name__,
+                    'timestamp': datetime.now().isoformat()
+                }
             }
-        }
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
