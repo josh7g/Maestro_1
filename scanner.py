@@ -268,7 +268,7 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        
+   
         try:
             findings = results.get('results', [])
             stats = results.get('stats', {})
@@ -292,15 +292,14 @@ class SecurityScanner:
             files_skipped = set()
             files_partial = set()
             files_error = set()
-            
-            # Process skipped files
-            for skip_type, skip_files in paths.get('skipped', {}).items():
-                if isinstance(skip_files, list):
-                    files_skipped.update(skip_files)
+
+            # Process skipped files - Fixed this part to handle list type
+            if isinstance(paths.get('skipped', []), list):
+                files_skipped.update(paths.get('skipped', []))
                     
-            # Process partial and error files
-            for error in errors:
-                if 'path' in error:
+            # Process partial and error files from errors list
+            for error in errors or []:
+                if isinstance(error, dict) and 'path' in error:
                     if 'Partially analyzed' in error.get('message', ''):
                         files_partial.add(error['path'])
                     else:
@@ -365,11 +364,11 @@ class SecurityScanner:
 
             # File details for debugging
             file_details = {
-                'scanned_files': sorted(list(files_scanned)),
-                'skipped_files': sorted(list(files_skipped)),
-                'partial_files': sorted(list(files_partial)),
-                'error_files': sorted(list(files_error)),
-                'files_with_findings': sorted(list(files_with_findings))
+                'scanned_files': sorted(list(files_scanned)) if files_scanned else [],
+                'skipped_files': sorted(list(files_skipped)) if files_skipped else [],
+                'partial_files': sorted(list(files_partial)) if files_partial else [],
+                'error_files': sorted(list(files_error)) if files_error else [],
+                'files_with_findings': sorted(list(files_with_findings)) if files_with_findings else []
             }
 
             return {
