@@ -80,22 +80,7 @@ class ScanConfig:
         '*.gz',
         '*.rar',
         '*.mp4',
-        '*.mov',
-        
-        # Additional excludes for larger repos
-        'coverage',
-        'test-results',
-        '.pytest_cache',
-        '.coverage',
-        '.nyc_output',
-        'reports',
-        '*.log',
-        '*.lock',
-        'fixtures',
-        'test_data',
-        'assets',
-        'images',
-        'docs'
+        '*.mov'
     ])
 
 class SecurityScanner:
@@ -284,8 +269,7 @@ class SecurityScanner:
                 "--no-git-ignore",
                 "--skip-unknown-extensions",
                 "--optimizations=all",
-                "--disable-version-check",
-                "--force-color",
+             
                 
                 str(target_dir)
             ]
