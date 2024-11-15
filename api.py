@@ -63,19 +63,75 @@ def get_file_content(owner: str, repo: str, user_id: str, installation_id: str, 
             'error': {'message': str(e)}
         }), 500
 
-@api.route('/files/<owner>/<repo>/<user_id>/<path:filename>', methods=['GET'])
-def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
-    from app import git_integration  # Import the git_integration instance from app.py
+@api.route('/files/<owner>/<repo>/<user_id>', methods=['POST'])
+def get_vulnerable_file(owner: str, repo: str, user_id: str):
+    """Fetch vulnerable file content from GitHub using POST"""
+    from app import git_integration
     
-    installation_id = request.args.get('installation_id')
+    # Get data from POST request body
+    request_data = request.get_json()
+    if not request_data:
+        return jsonify({
+            'success': False,
+            'error': {'message': 'Request body is required'}
+        }), 400
     
+    # Get required parameters from request body
+    installation_id = request_data.get('installation_id')
+    filename = request_data.get('filename')
+    
+    # Validate required parameters
     if not installation_id:
         return jsonify({
             'success': False,
-            'error': {'message': 'Missing installation_id parameter'}
+            'error': {'message': 'installation_id is required in request body'}
+        }), 400
+        
+    if not filename:
+        return jsonify({
+            'success': False,
+            'error': {'message': 'filename is required in request body'}
         }), 400
 
-    return get_file_content(owner, repo, user_id, installation_id, filename, git_integration)
+    try:
+        # Get GitHub token
+        installation_token = git_integration.get_access_token(int(installation_id)).token
+        gh = Github(installation_token)
+        
+        repository = gh.get_repo(f"{owner}/{repo}")
+        default_branch = repository.default_branch
+        latest_commit = repository.get_branch(default_branch).commit
+        commit_sha = latest_commit.sha
+
+        # Get file content from GitHub
+        try:
+            file_content = repository.get_contents(filename, ref=commit_sha)
+            content = file_content.decoded_content.decode('utf-8')
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'file': content,
+                    'user_id': user_id,
+                    'version': commit_sha,
+                    'reponame': f"{owner}/{repo}",
+                    'filename': filename
+                }
+            })
+
+        except Exception as e:
+            logger.error(f"Error fetching file: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': {'message': 'File not found or inaccessible'}
+            }), 404
+
+    except Exception as e:
+        logger.error(f"GitHub API error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': {'message': str(e)}
+        }), 500
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
 def get_repo_results(owner, repo):
     repository = f"{owner}/{repo}"
