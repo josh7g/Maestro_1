@@ -268,8 +268,7 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        
-   
+    
         try:
             findings = results.get('results', [])
             stats = results.get('stats', {})
@@ -288,35 +287,34 @@ class SecurityScanner:
             }
             category_counts = {}
             
-            # Track files by status using lists instead of sets for complex objects
-            files_scanned = []
-            files_skipped = []
-            files_partial = []
-            files_error = []
-            files_with_findings = []
+            # Properly track file counts from semgrep output
+            files_scanned = set()
+            files_skipped = set()
+            files_partial = set()
+            files_error = set()
+            files_with_findings = set()
 
             # Process scanned files
             if isinstance(paths.get('scanned', []), list):
-                files_scanned = paths.get('scanned', [])
+                files_scanned.update(str(path) for path in paths.get('scanned', []))
                 
             # Process skipped files
             if isinstance(paths.get('skipped', []), list):
                 for item in paths.get('skipped', []):
                     if isinstance(item, str):
-                        files_skipped.append(item)
+                        files_skipped.add(item)
                     elif isinstance(item, dict) and 'path' in item:
-                        files_skipped.append(item['path'])
+                        files_skipped.add(item['path'])
                         
-            # Process errors and partial files
+            # Process partial files and errors
             for error in errors or []:
                 if isinstance(error, dict) and 'path' in error:
-                    path = error['path']
-                    if isinstance(path, str):
-                        if 'Partially analyzed' in error.get('message', ''):
-                            files_partial.append(path)
-                        else:
-                            files_error.append(path)
-            
+                    path = str(error['path'])
+                    if 'Partially analyzed' in error.get('message', ''):
+                        files_partial.add(path)
+                    else:
+                        files_error.add(path)
+
             # Process findings
             for finding in findings:
                 try:
@@ -325,9 +323,9 @@ class SecurityScanner:
                         logger.warning("Memory limit reached during result processing")
                         break
 
-                    file_path = finding.get('path', '')
-                    if file_path and isinstance(file_path, str) and file_path not in files_with_findings:
-                        files_with_findings.append(file_path)
+                    file_path = str(finding.get('path', ''))
+                    if file_path:
+                        files_with_findings.add(file_path)
 
                     enhanced_finding = {
                         'id': finding.get('check_id'),
@@ -357,8 +355,8 @@ class SecurityScanner:
                     logger.error(f"Error processing finding: {str(e)}")
                     continue
 
-            # Calculate totals using lists
-            total_files = len(set(files_scanned + files_skipped + files_partial + files_error))
+            # Update scan statistics with correct file counts
+            total_files = len(files_scanned) + len(files_skipped) + len(files_partial) + len(files_error)
             
             scan_stats = {
                 **self.scan_stats,
@@ -372,13 +370,13 @@ class SecurityScanner:
                 'completion_rate': round((len(files_scanned) / total_files * 100), 2) if total_files > 0 else 0
             }
 
-            # File details for debugging - ensure unique entries
+            # File details for debugging
             file_details = {
-                'scanned_files': sorted(set(files_scanned)),
-                'skipped_files': sorted(set(files_skipped)),
-                'partial_files': sorted(set(files_partial)),
-                'error_files': sorted(set(files_error)),
-                'files_with_findings': sorted(set(files_with_findings))
+                'scanned_files': sorted(files_scanned),
+                'skipped_files': sorted(files_skipped),
+                'partial_files': sorted(files_partial),
+                'error_files': sorted(files_error),
+                'files_with_findings': sorted(files_with_findings)
             }
 
             return {
@@ -407,66 +405,48 @@ class SecurityScanner:
             logger.error(f"Error in _process_scan_results: {str(e)}")
             return self._create_empty_result(error=str(e))
 
-    def _create_empty_result(self, error: Optional[str] = None) -> Dict:
-        """Create empty result structure with optional error information"""
+async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
+    """Updated main method to ensure file stats are properly passed through"""
+    try:
+        # Clone the repository
+        repo_dir = await self._clone_repository(repo_url, installation_token)
+        
+        # Run the semgrep scan
+        scan_results = await self._run_semgrep_scan(repo_dir)
+        
         return {
-            'findings': [],
-            'stats': {
-                'total_findings': 0,
-                'severity_counts': {
-                    'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0
+            'success': True,
+            'data': {
+                'repository': repo_url,
+                'user_id': user_id,
+                'timestamp': datetime.now().isoformat(),
+                'findings': scan_results.get('findings', []),
+                'summary': {
+                    'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
+                    'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
+                    'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
+                    'files_scanned': scan_results.get('stats', {}).get('file_stats', {}).get('files_scanned', 0),
                 },
-                'category_counts': {},
-                'scan_stats': self.scan_stats,
-                'memory_usage_mb': self.scan_stats['memory_usage_mb']
-            },
-            'errors': [error] if error else []
+                'metadata': {
+                    'scan_duration_seconds': (
+                        datetime.now() - self.scan_stats['start_time']
+                    ).total_seconds() if self.scan_stats['start_time'] else 0,
+                    'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
+                }
+            }
         }
-
-    async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
-        """Main method to scan a repository with comprehensive error handling"""
-        try:
-            # Clone the repository
-            repo_dir = await self._clone_repository(repo_url, installation_token)
             
-            # Run the semgrep scan
-            scan_results = await self._run_semgrep_scan(repo_dir)
-            
-            return {
-                'success': True,
-                'data': {
-                    'repository': repo_url,
-                    'user_id': user_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'findings': scan_results.get('findings', []),
-                    'summary': {
-                        'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
-                        'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
-                        'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
-                        'files_scanned': self.scan_stats['files_processed'],
-                    },
-                    'metadata': {
-                        'scan_duration_seconds': (
-                            datetime.now() - self.scan_stats['start_time']
-                        ).total_seconds() if self.scan_stats['start_time'] else 0,
-                        'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
-                    }
-                }
+    except Exception as e:
+        logger.error(f"Scan repository error: {str(e)}")
+        return {
+            'success': False,
+            'error': {
+                'message': str(e),
+                'code': 'SCAN_ERROR',
+                'type': type(e).__name__,
+                'timestamp': datetime.now().isoformat()
             }
-            
-        except Exception as e:
-            logger.error(f"Scan repository error: {str(e)}")
-            return {
-                'success': False,
-                'error': {
-                    'message': str(e),
-                    'code': 'SCAN_ERROR',
-                    'type': type(e).__name__,
-                    'timestamp': datetime.now().isoformat()
-                }
-            }
-
-
+        }
 async def scan_repository_handler(
     repo_url: str,
     installation_token: str,
