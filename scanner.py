@@ -25,59 +25,29 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ScanConfig:
     """Configuration settings for security scanning"""
-    max_file_size_mb: int = 50  #25
-    max_total_size_mb: int = 500 #250
-    max_memory_mb: int = 900 #450
+    max_file_size_mb: int = 50
+    max_total_size_mb: int = 300  # Lower to prevent memory issues
+    max_memory_mb: int = 1500  # Leave 500MB for system/other processes
     
-    # Timeouts
-    timeout_seconds: int = 300
-    file_timeout_seconds: int = 30
+    timeout_seconds: int = 900  # 15 minutes total
+    file_timeout_seconds: int = 45
     max_retries: int = 2
     
-    # Process limits
+    # Single process due to 1 CPU
     concurrent_processes: int = 1
-    exclude_patterns: List[str] = field(default_factory=lambda: [
-        # Version Control
-        '.git',
-        '.svn',
-        
-        # Dependencies
-        'node_modules',
-        'vendor',
-        'bower_components',
-        'packages',
-        
-        # Build outputs
-        'dist',
-        'build',
-        'out',
-        
-        # Environment
-        'venv',
-        '.env',
-        '__pycache__',
-        
-        # Minified files
-        '*.min.js',
-        '*.min.css',
-        '*.bundle.js',
-        '*.bundle.css',
-        '*.map',
-        
-        # Large file types
-        '*.pdf',
-        '*.jpg',
-        '*.jpeg',
-        '*.png',
-        '*.gif',
-        '*.zip',
-        '*.tar',
-        '*.gz',
-        '*.rar',
-        '*.mp4',
-        '*.mov'
-    ])
 
+    # Added more exclusions to reduce processing
+    exclude_patterns: List[str] = field(default_factory=lambda: [
+        '.git', '.svn', 'node_modules', 'vendor',
+        'bower_components', 'packages', 'dist',
+        'build', 'out', 'venv', '.env', '__pycache__',
+        '*.min.js', '*.min.css', '*.bundle.js',
+        '*.bundle.css', '*.map', '*.pdf', '*.jpg',
+        '*.jpeg', '*.png', '*.gif', '*.zip', '*.tar',
+        '*.gz', '*.rar', '*.mp4', '*.mov', '*.lock',
+        'package-lock.json', 'yarn.lock',
+        'coverage', 'tests', 'test', 'docs'
+    ])
 
 class SecurityScanner:
     """Security scanner optimized for resource-constrained environments"""
