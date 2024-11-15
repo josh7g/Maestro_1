@@ -1,1 +1,1 @@
-web: PYTHONPATH=$PYTHONPATH:. uvicorn app:asgi_app --host 0.0.0.0 --port $PORT --workers 4 --timeout-keep-alive 75 --log-level info --limit-concurrency 2000 --backlog 2048 --proxy-headers --memory-limit 1800 --http httptools --loop uvloop
+web: PYTHONPATH=$PYTHONPATH:. uvicorn app:asgi_app --host 0.0.0.0 --port $PORT --workers 4 --timeout-keep-alive 75 --log-level info --limit-concurrency 2000 --backlog 2048 --proxy-headers --http httptools --loop uvloop
