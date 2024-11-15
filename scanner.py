@@ -272,7 +272,7 @@ class SecurityScanner:
                 "--config", "auto",
                 "--json",
                 "--verbose",
-                "--metrics=on"
+                "--metrics=on",
                 
                 # Resource limits
                 f"--max-memory={self.config.max_memory_mb}",
@@ -293,9 +293,11 @@ class SecurityScanner:
             env = os.environ.copy()
             env.update({
                 'SEMGREP_ENABLE_VERSION_CHECK': '0',
-                'SEMGREP_SEND_METRICS': '0',
+                'SEMGREP_SEND_METRICS': '1',
                 'SEMGREP_PROGRESS_FORMAT': 'tqdm'
             })
+
+            
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
