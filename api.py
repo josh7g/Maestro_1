@@ -100,12 +100,30 @@ def get_repo_results(owner, repo):
     page = int(request.args.get('page', 1))
     per_page = min(100, int(request.args.get('limit', 10)))
 
-    findings = result.results.get('findings', [])
-    scan_stats = result.results.get('stats', {})
+    # Extract data from results
+    scan_data = result.results
+    findings = scan_data.get('findings', [])
+    stats = scan_data.get('stats', {})
     
-    # Get file statistics
-    file_stats = scan_stats.get('file_stats', {})
+    # Get file statistics directly from scan results
+    file_stats = stats.get('file_stats', {})
+    scan_stats = stats.get('scan_stats', {})
     
+    # Count findings by severity and category
+    severity_counts = defaultdict(int)
+    category_counts = defaultdict(int)
+    files_with_findings = set()
+
+    for finding in findings:
+        severity = finding.get('severity', 'UNKNOWN')
+        category = finding.get('category', 'unknown')
+        file_path = finding.get('file', '')
+        
+        severity_counts[severity] += 1
+        category_counts[category] += 1
+        if file_path:
+            files_with_findings.add(file_path)
+
     # Apply filters
     if severity:
         findings = [f for f in findings if f.get('severity') == severity]
@@ -114,39 +132,32 @@ def get_repo_results(owner, repo):
 
     # Paginate
     total_findings = len(findings)
-    findings = findings[(page-1)*per_page:page*per_page]
+    paginated_findings = findings[(page-1)*per_page:page*per_page]
 
+    # Build response using actual scan data
     return jsonify({
         'success': True,
         'data': {
             'repository': repository,
             'timestamp': result.timestamp.isoformat(),
-            'findings': findings,
+            'findings': paginated_findings,
             'summary': {
                 'files': {
                     'total': file_stats.get('total_files', 0),
                     'scanned': file_stats.get('files_scanned', 0),
                     'skipped': file_stats.get('files_skipped', 0),
                     'partial': file_stats.get('files_partial', 0),
-                    'with_findings': file_stats.get('files_with_findings', 0),
+                    'with_findings': len(files_with_findings),
                     'errors': file_stats.get('files_error', 0),
                     'completion_rate': file_stats.get('completion_rate', 0)
                 },
-                'severity_counts': scan_stats.get('severity_counts', {
-                    'CRITICAL': 0,
-                    'HIGH': 0,
-                    'MEDIUM': 0,
-                    'LOW': 0,
-                    'INFO': 0,
-                    'WARNING': 0,
-                    'ERROR': 0
-                }),
-                'category_counts': scan_stats.get('category_counts', {}),
-                'total_findings': scan_stats.get('total_findings', 0)
+                'severity_counts': dict(severity_counts),
+                'category_counts': dict(category_counts),
+                'total_findings': total_findings
             },
             'metadata': {
-                'scan_duration': scan_stats.get('scan_stats', {}).get('scan_duration', 0),
-                'memory_usage_mb': scan_stats.get('memory_usage_mb', 0),
+                'scan_duration': scan_stats.get('scan_duration', 0),
+                'memory_usage_mb': stats.get('memory_usage_mb', 0),
                 'analysis_id': result.id,
                 'status': result.status
             },
@@ -156,16 +167,9 @@ def get_repo_results(owner, repo):
                 'total': total_findings,
                 'pages': (total_findings + per_page - 1) // per_page
             },
-            'file_details': result.results.get('file_details', {
-                'scanned_files': [],
-                'skipped_files': [],
-                'partial_files': [],
-                'error_files': [],
-                'files_with_findings': []
-            })
+            'file_details': scan_data.get('file_details', {})
         }
     })
-
 @api.route('/users/<user_id>/top-vulnerabilities', methods=['GET'])
 def get_top_vulnerabilities(user_id):
     try:

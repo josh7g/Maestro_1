@@ -268,26 +268,13 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-    
+        """Process scan results with stats tracking"""
         try:
             findings = results.get('results', [])
-            stats = results.get('stats', {})
             paths = results.get('paths', {})
             errors = results.get('errors', [])
             
-            processed_findings = []
-            severity_counts = {
-                'CRITICAL': 0, 
-                'HIGH': 0, 
-                'MEDIUM': 0, 
-                'LOW': 0, 
-                'INFO': 0, 
-                'WARNING': 0, 
-                'ERROR': 0
-            }
-            category_counts = {}
-            
-            # Properly track file counts from semgrep output
+            # Track files by status
             files_scanned = set()
             files_skipped = set()
             files_partial = set()
@@ -295,18 +282,20 @@ class SecurityScanner:
             files_with_findings = set()
 
             # Process scanned files
-            if isinstance(paths.get('scanned', []), list):
-                files_scanned.update(str(path) for path in paths.get('scanned', []))
-                
+            scanned_files = paths.get('scanned', [])
+            if isinstance(scanned_files, list):
+                files_scanned.update(str(path) for path in scanned_files)
+
             # Process skipped files
-            if isinstance(paths.get('skipped', []), list):
-                for item in paths.get('skipped', []):
+            skipped_files = paths.get('skipped', [])
+            if isinstance(skipped_files, list):
+                for item in skipped_files:
                     if isinstance(item, str):
                         files_skipped.add(item)
                     elif isinstance(item, dict) and 'path' in item:
                         files_skipped.add(item['path'])
-                        
-            # Process partial files and errors
+
+            # Process errors and partial files
             for error in errors or []:
                 if isinstance(error, dict) and 'path' in error:
                     path = str(error['path'])
@@ -315,77 +304,47 @@ class SecurityScanner:
                     else:
                         files_error.add(path)
 
-            # Process findings
+            # Process findings and track files with issues
+            processed_findings = []
+            severity_counts = defaultdict(int)
+            category_counts = defaultdict(int)
+
             for finding in findings:
-                try:
-                    current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
-                    if current_memory > self.config.max_memory_mb:
-                        logger.warning("Memory limit reached during result processing")
-                        break
+                file_path = str(finding.get('path', ''))
+                if file_path:
+                    files_with_findings.add(file_path)
 
-                    file_path = str(finding.get('path', ''))
-                    if file_path:
-                        files_with_findings.add(file_path)
+                severity = finding.get('extra', {}).get('severity', 'INFO').upper()
+                category = finding.get('extra', {}).get('metadata', {}).get('category', 'security')
+                
+                severity_counts[severity] += 1
+                category_counts[category] += 1
+                
+                processed_findings.append({
+                    'id': finding.get('check_id'),
+                    'file': file_path,
+                    'line_start': finding.get('start', {}).get('line'),
+                    'line_end': finding.get('end', {}).get('line'),
+                    'code_snippet': finding.get('extra', {}).get('lines', ''),
+                    'message': finding.get('extra', {}).get('message', ''),
+                    'severity': severity,
+                    'category': category,
+                    'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                    'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                    'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
+                    'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
+                })
 
-                    enhanced_finding = {
-                        'id': finding.get('check_id'),
-                        'file': file_path,
-                        'line_start': finding.get('start', {}).get('line'),
-                        'line_end': finding.get('end', {}).get('line'),
-                        'code_snippet': finding.get('extra', {}).get('lines', ''),
-                        'message': finding.get('extra', {}).get('message', ''),
-                        'severity': finding.get('extra', {}).get('severity', 'INFO').upper(),
-                        'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
-                        'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                        'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                        'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
-                        'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
-                    }
-                    
-                    severity = enhanced_finding['severity']
-                    category = enhanced_finding['category']
-                    
-                    severity_counts[severity] = severity_counts.get(severity, 0) + 1
-                    category_counts[category] = category_counts.get(category, 0) + 1
-                    
-                    processed_findings.append(enhanced_finding)
-                    self.scan_stats['findings_count'] += 1
-
-                except Exception as e:
-                    logger.error(f"Error processing finding: {str(e)}")
-                    continue
-
-            # Update scan statistics with correct file counts
-            total_files = len(files_scanned) + len(files_skipped) + len(files_partial) + len(files_error)
-            
-            scan_stats = {
-                **self.scan_stats,
-                'total_files': total_files,
-                'files_scanned': len(files_scanned),
-                'files_with_findings': len(files_with_findings),
-                'files_skipped': len(files_skipped),
-                'files_partial': len(files_partial),
-                'files_error': len(files_error),
-                'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds(),
-                'completion_rate': round((len(files_scanned) / total_files * 100), 2) if total_files > 0 else 0
-            }
-
-            # File details for debugging
-            file_details = {
-                'scanned_files': sorted(files_scanned),
-                'skipped_files': sorted(files_skipped),
-                'partial_files': sorted(files_partial),
-                'error_files': sorted(files_error),
-                'files_with_findings': sorted(files_with_findings)
-            }
+            # Calculate totals and stats
+            total_files = len(files_scanned.union(files_skipped, files_partial, files_error))
+            completion_rate = (len(files_scanned) / total_files * 100) if total_files > 0 else 0
 
             return {
                 'findings': processed_findings,
                 'stats': {
                     'total_findings': len(processed_findings),
-                    'severity_counts': severity_counts,
-                    'category_counts': category_counts,
-                    'scan_stats': scan_stats,
+                    'severity_counts': dict(severity_counts),
+                    'category_counts': dict(category_counts),
                     'file_stats': {
                         'total_files': total_files,
                         'files_scanned': len(files_scanned),
@@ -393,12 +352,21 @@ class SecurityScanner:
                         'files_skipped': len(files_skipped),
                         'files_partial': len(files_partial),
                         'files_error': len(files_error),
-                        'completion_rate': scan_stats['completion_rate']
+                        'completion_rate': round(completion_rate, 2)
                     },
-                    'memory_usage_mb': self.scan_stats['memory_usage_mb']
+                    'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024),
+                    'scan_stats': {
+                        'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds()
+                        if self.scan_stats.get('start_time') else 0
+                    }
                 },
-                'file_details': file_details,
-                'errors': errors
+                'file_details': {
+                    'scanned_files': sorted(files_scanned),
+                    'skipped_files': sorted(files_skipped),
+                    'partial_files': sorted(files_partial),
+                    'error_files': sorted(files_error),
+                    'files_with_findings': sorted(files_with_findings)
+                }
             }
 
         except Exception as e:
