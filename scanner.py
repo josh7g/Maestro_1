@@ -268,6 +268,7 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
+        
    
         try:
             findings = results.get('results', [])
@@ -287,27 +288,36 @@ class SecurityScanner:
             }
             category_counts = {}
             
-            # Track files by status
-            files_scanned = set(paths.get('scanned', []))
-            files_skipped = set()
-            files_partial = set()
-            files_error = set()
+            # Track files by status using lists instead of sets for complex objects
+            files_scanned = []
+            files_skipped = []
+            files_partial = []
+            files_error = []
+            files_with_findings = []
 
-            # Process skipped files - Fixed this part to handle list type
+            # Process scanned files
+            if isinstance(paths.get('scanned', []), list):
+                files_scanned = paths.get('scanned', [])
+                
+            # Process skipped files
             if isinstance(paths.get('skipped', []), list):
-                files_skipped.update(paths.get('skipped', []))
-                    
-            # Process partial and error files from errors list
+                for item in paths.get('skipped', []):
+                    if isinstance(item, str):
+                        files_skipped.append(item)
+                    elif isinstance(item, dict) and 'path' in item:
+                        files_skipped.append(item['path'])
+                        
+            # Process errors and partial files
             for error in errors or []:
                 if isinstance(error, dict) and 'path' in error:
-                    if 'Partially analyzed' in error.get('message', ''):
-                        files_partial.add(error['path'])
-                    else:
-                        files_error.add(error['path'])
-                        
-            # Track files with findings
-            files_with_findings = set()
+                    path = error['path']
+                    if isinstance(path, str):
+                        if 'Partially analyzed' in error.get('message', ''):
+                            files_partial.append(path)
+                        else:
+                            files_error.append(path)
             
+            # Process findings
             for finding in findings:
                 try:
                     current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
@@ -316,8 +326,8 @@ class SecurityScanner:
                         break
 
                     file_path = finding.get('path', '')
-                    if file_path:
-                        files_with_findings.add(file_path)
+                    if file_path and isinstance(file_path, str) and file_path not in files_with_findings:
+                        files_with_findings.append(file_path)
 
                     enhanced_finding = {
                         'id': finding.get('check_id'),
@@ -347,8 +357,8 @@ class SecurityScanner:
                     logger.error(f"Error processing finding: {str(e)}")
                     continue
 
-            # Update scan statistics
-            total_files = len(files_scanned.union(files_skipped, files_partial, files_error))
+            # Calculate totals using lists
+            total_files = len(set(files_scanned + files_skipped + files_partial + files_error))
             
             scan_stats = {
                 **self.scan_stats,
@@ -362,13 +372,13 @@ class SecurityScanner:
                 'completion_rate': round((len(files_scanned) / total_files * 100), 2) if total_files > 0 else 0
             }
 
-            # File details for debugging
+            # File details for debugging - ensure unique entries
             file_details = {
-                'scanned_files': sorted(list(files_scanned)) if files_scanned else [],
-                'skipped_files': sorted(list(files_skipped)) if files_skipped else [],
-                'partial_files': sorted(list(files_partial)) if files_partial else [],
-                'error_files': sorted(list(files_error)) if files_error else [],
-                'files_with_findings': sorted(list(files_with_findings)) if files_with_findings else []
+                'scanned_files': sorted(set(files_scanned)),
+                'skipped_files': sorted(set(files_skipped)),
+                'partial_files': sorted(set(files_partial)),
+                'error_files': sorted(set(files_error)),
+                'files_with_findings': sorted(set(files_with_findings))
             }
 
             return {
@@ -395,27 +405,7 @@ class SecurityScanner:
 
         except Exception as e:
             logger.error(f"Error in _process_scan_results: {str(e)}")
-            return {
-                'findings': [],
-                'stats': {
-                    'total_findings': 0,
-                    'severity_counts': severity_counts,
-                    'category_counts': {},
-                    'scan_stats': self.scan_stats,
-                    'file_stats': {
-                        'total_files': 0,
-                        'files_scanned': 0,
-                        'files_with_findings': 0,
-                        'files_skipped': 0,
-                        'files_partial': 0,
-                        'files_error': 0,
-                        'completion_rate': 0
-                    },
-                    'memory_usage_mb': self.scan_stats['memory_usage_mb']
-                },
-                'file_details': {},
-                'errors': [str(e)]
-            }
+            return self._create_empty_result(error=str(e))
 
     def _create_empty_result(self, error: Optional[str] = None) -> Dict:
         """Create empty result structure with optional error information"""
