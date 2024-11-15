@@ -195,6 +195,8 @@ class SecurityScanner:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
+        
+    
 
     async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
         """Execute memory-conscious semgrep scan"""
@@ -243,6 +245,13 @@ class SecurityScanner:
                 process.kill()
                 logger.error(f"Scan timed out after {self.config.timeout_seconds}s")
                 return self._create_empty_result(error="Scan timed out")
+            
+            # Store the full stderr output which contains the scan statistics
+            scan_output = stderr.decode() if stderr else ""
+
+            output = stdout.decode() if stdout else ""
+            if not output.strip():
+                return self._create_empty_result()
 
             self.scan_stats['memory_usage_mb'] = psutil.Process().memory_info().rss / (1024 * 1024)
             
@@ -257,6 +266,9 @@ class SecurityScanner:
             try:
                 results = json.loads(output)
                 return self._process_scan_results(results)
+                processed_results['scan_output'] = scan_output
+                return processed_results
+                
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse Semgrep JSON output: {str(e)}")
                 return self._create_empty_result(error="Invalid Semgrep output format")
@@ -264,9 +276,7 @@ class SecurityScanner:
         except Exception as e:
             logger.error(f"Error in semgrep scan: {str(e)}")
             return self._create_empty_result(error=str(e))
-        finally:
-            if semgrepignore_path.exists():
-                semgrepignore_path.unlink()
+        
     def _create_empty_result(self, error: Optional[str] = None) -> Dict:
    
         return {
