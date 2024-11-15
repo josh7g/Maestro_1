@@ -24,18 +24,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
-    """Render-optimized configuration"""
+    """Configuration for large repository scanning"""
     max_file_size_mb: int = 25
     max_total_size_mb: int = 300
     max_memory_mb: int = 1500
-    chunk_size_mb: int = 50
+    chunk_size_mb: int = 30  # Smaller chunks
+    max_files_per_chunk: int = 50
     
-    # Web service timeout aligned
-    timeout_seconds: int = 540  # 9 minutes (Render's 10min limit minus buffer)
-    file_timeout_seconds: int = 30
+    timeout_seconds: int = 540  # 9 minutes
+    chunk_timeout: int = 120    # 2 minutes per chunk
+    file_timeout_seconds: int = 20
     max_retries: int = 2
     concurrent_processes: int = 1
-    
+
     exclude_patterns: List[str] = field(default_factory=lambda: [
         '.git', '.svn', 'node_modules', 'vendor',
         'bower_components', 'packages', 'dist',
@@ -46,57 +47,101 @@ class ScanConfig:
         'coverage', 'test*', 'docs'
     ])
 
-async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
-    """Scan repository with early timeout detection"""
-    start_time = time.time()
+async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
+    """Chunked scanning for large repositories"""
+    all_files = []
+    current_size = 0
+    chunks = []
+    current_chunk = []
     
+    # Collect and sort files by size
+    for root, _, files in os.walk(target_dir):
+        for file in files:
+            if any(fnmatch.fnmatch(file, pattern) for pattern in self.config.exclude_patterns):
+                continue
+            
+            file_path = Path(root) / file
+            try:
+                size = file_path.stat().st_size / (1024 * 1024)  # MB
+                if size <= self.config.max_file_size_mb:
+                    all_files.append((str(file_path), size))
+                    current_size += size
+            except Exception as e:
+                logger.warning(f"Error accessing {file_path}: {e}")
+    
+    # Sort files by size (largest first)
+    all_files.sort(key=lambda x: x[1], reverse=True)
+    
+    # Create chunks
+    for file_path, size in all_files:
+        if (len(current_chunk) >= self.config.max_files_per_chunk or 
+            sum(s for _, s in current_chunk) + size > self.config.chunk_size_mb):
+            if current_chunk:
+                chunks.append([f for f, _ in current_chunk])
+                current_chunk = []
+        current_chunk.append((file_path, size))
+    
+    if current_chunk:
+        chunks.append([f for f, _ in current_chunk])
+    
+    # Process chunks with timeout
+    results = []
+    total_chunks = len(chunks)
+    
+    for i, chunk in enumerate(chunks, 1):
+        try:
+            logger.info(f"Processing chunk {i}/{total_chunks} ({len(chunk)} files)")
+            chunk_result = await asyncio.wait_for(
+                self._scan_chunk(chunk),
+                timeout=self.config.chunk_timeout
+            )
+            results.extend(chunk_result)
+        except asyncio.TimeoutError:
+            logger.warning(f"Chunk {i} timed out, skipping")
+            continue
+        except Exception as e:
+            logger.error(f"Error processing chunk {i}: {e}")
+            continue
+    
+    return self._process_scan_results(results)
+
+async def _scan_chunk(self, files: List[str]) -> List[Dict]:
+    """Scan a single chunk of files"""
     try:
-        # Clone with timeout
-        repo_dir = await asyncio.wait_for(
-            self._clone_repository(repo_url, installation_token),
-            timeout=120  # 2 minutes for cloning
-        )
-        
-        # Calculate remaining time
-        elapsed = time.time() - start_time
-        remaining = self.config.timeout_seconds - elapsed
-        
-        if remaining < 60:  # Less than 1 minute remaining
-            raise TimeoutError("Insufficient time remaining for scan")
+        cmd = [
+            "semgrep",
+            "scan",
+            "--config", "auto",
+            "--json",
+            "--metrics=on",
+            f"--max-memory={self.config.max_memory_mb}",
+            "--jobs=1",
+            f"--timeout={self.config.file_timeout_seconds}",
+            "--optimizations=all",
             
-        # Run scan with remaining time
-        scan_results = await asyncio.wait_for(
-            self._run_semgrep_scan(repo_dir),
-            timeout=remaining
+        ] + files
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+
+        stdout, stderr = await process.communicate()
         
-        return {
-            'success': True,
-            'data': {
-                'repository': repo_url,
-                'user_id': user_id,
-                'timestamp': datetime.now().isoformat(),
-                'findings': scan_results.get('results', []),
-                'summary': {
-                    'total_findings': len(scan_results.get('results', [])),
-                    'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
-                    'scan_duration': time.time() - start_time
-                }
-            }
-        }
+        if process.returncode != 0:
+            logger.warning(f"Semgrep error: {stderr.decode()}")
+            return []
             
-    except asyncio.TimeoutError:
-        return {
-            'success': False,
-            'error': {
-                'message': 'Scan timed out',
-                'code': 'TIMEOUT_ERROR',
-                'details': {
-                    'elapsed_seconds': time.time() - start_time,
-                    'limit_seconds': self.config.timeout_seconds
-                }
-            }
-        }
+        output = stdout.decode()
+        if not output.strip():
+            return []
+            
+        return json.loads(output).get('results', [])
+            
+    except Exception as e:
+        logger.error(f"Chunk scan error: {e}")
+        return []
 class SecurityScanner:
     """Security scanner optimized for resource-constrained environments"""
     
@@ -289,7 +334,7 @@ class SecurityScanner:
                 semgrepignore_path.unlink()
 
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results with enhanced metrics"""
+        """Process scan results with accurate file counting"""
         findings = results.get('results', [])
         stats = results.get('stats', {})
         
@@ -297,45 +342,42 @@ class SecurityScanner:
         severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0, 'WARNING': 0, 'ERROR': 0}
         category_counts = {}
         
-        # Track unique files scanned
-        files_scanned = set()
+        # Track all files from semgrep stats
+        total_files = stats.get('total_files', 0)
+        files_with_findings = set()
         
         for finding in findings:
-            current_memory = psutil.Process().memory_info().rss / (1024 * 1024)
-            if current_memory > self.config.max_memory_mb:
-                logger.warning("Memory limit reached during result processing")
-                break
-
             file_path = finding.get('path', '')
             if file_path:
-                files_scanned.add(file_path)
+                files_with_findings.add(file_path)
 
-            enhanced_finding = {
+            severity = finding.get('extra', {}).get('severity', 'INFO').upper()
+            category = finding.get('extra', {}).get('metadata', {}).get('category', 'security')
+            
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            category_counts[category] = category_counts.get(category, 0) + 1
+            
+            processed_findings.append({
                 'id': finding.get('check_id'),
                 'file': file_path,
                 'line_start': finding.get('start', {}).get('line'),
                 'line_end': finding.get('end', {}).get('line'),
                 'code_snippet': finding.get('extra', {}).get('lines', ''),
                 'message': finding.get('extra', {}).get('message', ''),
-                'severity': finding.get('extra', {}).get('severity', 'INFO').upper(),
-                'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
+                'severity': severity,
+                'category': category,
                 'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
                 'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
                 'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', ''),
                 'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
-            }
-            
-            severity = enhanced_finding['severity']
-            category = enhanced_finding['category']
-            
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-            category_counts[category] = category_counts.get(category, 0) + 1
-            
-            processed_findings.append(enhanced_finding)
-            self.scan_stats['findings_count'] += 1
+            })
 
-            self.scan_stats['files_processed'] = len(files_scanned)
-        
+        self.scan_stats.update({
+            'total_files': total_files,
+            'files_processed': len(files_with_findings),
+            'findings_count': len(processed_findings)
+        })
+
         return {
             'findings': processed_findings,
             'stats': {
@@ -344,14 +386,11 @@ class SecurityScanner:
                 'category_counts': category_counts,
                 'scan_stats': {
                     **self.scan_stats,
-                    'total_files_scanned': self.scan_stats['total_files'],
-                    'files_with_findings': self.scan_stats['files_processed'],
-                    'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds()
-                },
-                'memory_usage_mb': self.scan_stats['memory_usage_mb']
+                    'total_files_scanned': total_files,
+                    'files_with_findings': len(files_with_findings)
+                }
             }
         }
-
     def _create_empty_result(self, error: Optional[str] = None) -> Dict:
         """Create empty result structure with optional error information"""
         return {
