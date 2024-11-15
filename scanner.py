@@ -272,7 +272,7 @@ class SecurityScanner:
                 "--config", "auto",
                 "--json",
                 "--verbose",
-                "--metrics=off",  # Changed from --disable-metrics
+                "--metrics=on"
                 
                 # Resource limits
                 f"--max-memory={self.config.max_memory_mb}",
