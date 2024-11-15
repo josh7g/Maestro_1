@@ -76,7 +76,6 @@ def get_vulnerable_file(owner: str, repo: str, user_id: str, filename: str):
         }), 400
 
     return get_file_content(owner, repo, user_id, installation_id, filename, git_integration)
-
 @api.route('/repos/<owner>/<repo>/results', methods=['GET'])
 def get_repo_results(owner, repo):
     repository = f"{owner}/{repo}"
@@ -100,48 +99,9 @@ def get_repo_results(owner, repo):
     page = int(request.args.get('page', 1))
     per_page = min(100, int(request.args.get('limit', 10)))
 
-    # Extract data from stored scan results
+    # Get the stored analysis data which already has the correct counts
+    stored_summary = result.results.get('summary', {})
     findings = result.results.get('findings', [])
-    scan_data = result.results.get('stats', {})
-    scan_output = result.results.get('scan_output', '')  # Store semgrep output in results
-    
-    # Parse scan output for statistics if available
-    file_stats = {}
-    if scan_output:
-        import re
-        
-        # Extract total and scanned files
-        scan_match = re.search(r'Scanning (\d+) files', scan_output)
-        total_files = int(scan_match.group(1)) if scan_match else 0
-        
-        run_match = re.search(r'Ran \d+ rules on (\d+) files: (\d+) findings', scan_output)
-        files_scanned = int(run_match.group(1)) if run_match else 0
-        
-        # Count skipped files
-        skipped_files = len(re.findall(r'^\s+•\s+.*$', scan_output, re.MULTILINE))
-        
-        # Count partially analyzed files
-        partial_files = len(re.findall(r'Partially analyzed due to parsing or internal Semgrep errors.*?(?=\n\s*\n|\Z)', 
-                                     scan_output, re.DOTALL)[0].split('\n')) - 1 if 'Partially analyzed' in scan_output else 0
-        
-        file_stats = {
-            'total': total_files,
-            'scanned': files_scanned,
-            'skipped': skipped_files,
-            'partial': partial_files,
-            'with_findings': len(set(f.get('file', '') for f in findings if f.get('file'))),
-            'errors': len(result.results.get('errors', [])),
-            'completion_rate': round((files_scanned / total_files * 100), 2) if total_files > 0 else 0
-        }
-    
-    # Calculate severity and category counts from findings
-    severity_counts = {}
-    category_counts = {}
-    for finding in findings:
-        severity = finding.get('severity', 'UNKNOWN')
-        category = finding.get('category', 'unknown')
-        severity_counts[severity] = severity_counts.get(severity, 0) + 1
-        category_counts[category] = category_counts.get(category, 0) + 1
 
     # Apply filters
     if severity:
@@ -160,14 +120,14 @@ def get_repo_results(owner, repo):
             'timestamp': result.timestamp.isoformat(),
             'findings': paginated_findings,
             'summary': {
-                'files': file_stats,
-                'severity_counts': severity_counts,
-                'category_counts': category_counts,
-                'total_findings': total_findings
+                'total_findings': stored_summary.get('total_findings', 0),  # Will be 80
+                'files_scanned': stored_summary.get('files_scanned', 0),    # Will be 133
+                'severity_counts': stored_summary.get('severity_counts', {}),
+                'category_counts': stored_summary.get('category_counts', {})
             },
             'metadata': {
-                'scan_duration': result.results.get('duration_seconds', 0),
-                'memory_usage_mb': scan_data.get('memory_usage_mb', 0),
+                'scan_duration': result.results.get('metadata', {}).get('duration_seconds', 0),
+                'memory_usage_mb': result.results.get('stats', {}).get('memory_usage_mb', 0),
                 'analysis_id': result.id,
                 'status': result.status
             },
