@@ -23,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress asyncio warnings about long-running tasks
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+
 @dataclass
 class ScanConfig:
     """Configuration settings for security scanning optimized for Standard plan"""
@@ -138,7 +141,6 @@ class SecurityScanner:
                     current_memory
                 )
                 
-                # Alert if memory usage is high
                 if current_memory > self.config.max_memory_mb * 0.9:
                     logger.warning(
                         f"High memory usage detected: {current_memory:.2f}MB / "
@@ -220,7 +222,6 @@ class SecurityScanner:
     async def _clone_repository(self, repo_url: str, token: str) -> Path:
         """Clone repository with size validation and optimizations"""
         try:
-            # Check repository size first
             size_info = await self._check_repository_size(repo_url, token)
             if not size_info['is_compatible']:
                 raise ValueError(
@@ -233,7 +234,6 @@ class SecurityScanner:
             
             logger.info(f"Cloning repository to {self.repo_dir}")
             
-            # Optimized clone options
             git_options = [
                 '--depth=1',
                 '--single-branch',
@@ -272,7 +272,7 @@ class SecurityScanner:
                 "--config", "auto",
                 "--json",
                 "--verbose",
-                "--metrics=on",
+                "--metrics=off",  # Changed from --disable-metrics
                 
                 # Resource limits
                 f"--max-memory={self.config.max_memory_mb}",
@@ -285,13 +285,11 @@ class SecurityScanner:
                 "--skip-unknown-extensions",
                 "--optimizations=all",
                 "--disable-version-check",
-                "--disable-metrics",
                 "--force-color",
                 
                 str(target_dir)
             ]
 
-            # Set environment variables
             env = os.environ.copy()
             env.update({
                 'SEMGREP_ENABLE_VERSION_CHECK': '0',
@@ -372,14 +370,12 @@ class SecurityScanner:
             paths = results.get('paths', {})
             errors = results.get('errors', [])
             
-            # Track files by status
             files_scanned = set()
             files_skipped = set()
             files_partial = set()
             files_error = set()
             files_with_findings = set()
 
-            # Process paths
             for path in paths.get('scanned', []):
                 files_scanned.add(str(path))
             
@@ -389,7 +385,6 @@ class SecurityScanner:
                 elif isinstance(item, dict) and 'path' in item:
                     files_skipped.add(item['path'])
 
-            # Process errors
             for error in errors or []:
                 if isinstance(error, dict) and 'path' in error:
                     path = str(error['path'])
@@ -398,7 +393,6 @@ class SecurityScanner:
                     else:
                         files_error.add(path)
 
-            # Process findings
             processed_findings = []
             severity_counts = defaultdict(int)
             category_counts = defaultdict(int)
@@ -429,7 +423,6 @@ class SecurityScanner:
                     'references': finding.get('extra', {}).get('metadata', {}).get('references', [])
                 })
 
-            # Calculate totals and completion rate
             total_files = len(files_scanned.union(files_skipped, files_partial, files_error))
             completion_rate = (len(files_scanned) / total_files * 100) if total_files > 0 else 0
 
@@ -527,26 +520,88 @@ class SecurityScanner:
                 }
             }
 
-# Utility functions
-def format_file_size(size_bytes: int) -> str:
-    """Convert bytes to human readable format"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.2f} TB"
+async def scan_repository_handler(
+    repo_url: str,
+    installation_token: str,
+    user_id: str,
+    db_session: Optional[Session] = None
+) -> Dict:
+    """Handler function for web routes with input validation"""
+    logger.info(f"Starting scan request for repository: {repo_url}")
+    
+    if not all([repo_url, installation_token, user_id]):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Missing required parameters',
+                'code': 'INVALID_PARAMETERS'
+            }
+        }
 
+    try:
+        # Increase timeout for the entire scanning process
+        return await asyncio.wait_for(
+            _scan_repository_handler_inner(repo_url, installation_token, user_id, db_session),
+            timeout=600  # 10 minutes timeout
+        )
+    except asyncio.TimeoutError:
+        return {
+            'success': False,
+            'error': {
+                'message': 'Scan operation timed out',
+                'code': 'SCAN_TIMEOUT'
+            }
+        }
+
+async def _scan_repository_handler_inner(
+    repo_url: str,
+    installation_token: str,
+    user_id: str,
+    db_session: Optional[Session] = None
+) -> Dict:
+    """Internal handler with actual scan logic"""
+    try:
+        config = ScanConfig()
+        
+        async with SecurityScanner(config, db_session) as scanner:
+            try:
+                return await scanner.scan_repository(
+                    repo_url,
+                    installation_token,
+                    user_id
+                )
+            except ValueError as ve:
+                return {
+                    'success': False,
+                    'error': {
+                        'message': str(ve),
+                        'code': 'VALIDATION_ERROR'
+                    }
+                }
+            
+    except Exception as e:
+        logger.error(f"Handler error: {str(e)}")
+        return {
+            'success': False,
+            'error': {
+                'message': 'Unexpected error in scan handler',
+                'code': 'INTERNAL_ERROR',
+                'details': str(e)
+            }
+        }
+
+# Utility functions
 def validate_repository_url(url: str) -> bool:
     """Validate GitHub repository URL format"""
     if not url:
         return False
     
+    import re
     valid_formats = [
         r'https://github.com/[\w-]+/[\w-]+(?:\.git)?$',
         r'git@github\.com:[\w-]+/[\w-]+(?:\.git)?$'
     ]
     
-    import re
     return any(re.match(pattern, url) for pattern in valid_formats)
 
 def get_severity_weight(severity: str) -> int:
@@ -567,93 +622,6 @@ def sort_findings_by_severity(findings: List[Dict]) -> List[Dict]:
         key=lambda x: get_severity_weight(x.get('severity', 'INFO')),
         reverse=True
     )
-
-async def scan_repository_handler(
-    repo_url: str,
-    installation_token: str,
-    user_id: str,
-    db_session: Optional[Session] = None
-) -> Dict:
-    """Handler function for web routes with input validation"""
-    logger.info(f"Starting scan request for repository: {repo_url}")
-    
-    if not all([repo_url, installation_token, user_id]):
-        return {
-            'success': False,
-            'error': {
-                'message': 'Missing required parameters',
-                'code': 'INVALID_PARAMETERS'
-            }
-        }
-
-    if not validate_repository_url(repo_url):
-        return {
-            'success': False,
-            'error': {
-                'message': 'Invalid repository URL format',
-                'code': 'INVALID_REPOSITORY_URL',
-                'details': 'Only GitHub repositories are supported'
-            }
-        }
-
-    try:
-        config = ScanConfig()
-        
-        async with SecurityScanner(config, db_session) as scanner:
-            try:
-                # Pre-check repository size
-                size_info = await scanner._check_repository_size(repo_url, installation_token)
-                if not size_info['is_compatible']:
-                    return {
-                        'success': False,
-                        'error': {
-                            'message': 'Repository too large for analysis',
-                            'code': 'REPOSITORY_TOO_LARGE',
-                            'details': {
-                                'size_mb': size_info['size_mb'],
-                                'limit_mb': config.max_total_size_mb,
-                                'recommendation': 'Consider analyzing specific directories or branches'
-                            }
-                        }
-                    }
-                
-                return await scanner.scan_repository(
-                    repo_url,
-                    installation_token,
-                    user_id
-                )
-
-            except ValueError as ve:
-                return {
-                    'success': False,
-                    'error': {
-                        'message': str(ve),
-                        'code': 'VALIDATION_ERROR'
-                    }
-                }
-            
-            except git.GitCommandError as ge:
-                return {
-                    'success': False,
-                    'error': {
-                        'message': 'Git operation failed',
-                        'code': 'GIT_ERROR',
-                        'details': str(ge)
-                    }
-                }
-
-    except Exception as e:
-        logger.error(f"Handler error: {str(e)}")
-        return {
-            'success': False,
-            'error': {
-                'message': 'Unexpected error in scan handler',
-                'code': 'INTERNAL_ERROR',
-                'details': str(e),
-                'type': type(e).__name__,
-                'timestamp': datetime.now().isoformat()
-            }
-        }
 
 if __name__ == "__main__":
     # Example usage
