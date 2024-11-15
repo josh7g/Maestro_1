@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from sqlalchemy.orm import Session
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -266,9 +267,49 @@ class SecurityScanner:
         finally:
             if semgrepignore_path.exists():
                 semgrepignore_path.unlink()
-
+    def _create_empty_result(self, error: Optional[str] = None) -> Dict:
+   
+        return {
+            'findings': [],
+            'stats': {
+                'total_findings': 0,
+                'severity_counts': {
+                    'CRITICAL': 0,
+                    'HIGH': 0,
+                    'MEDIUM': 0,
+                    'LOW': 0,
+                    'INFO': 0,
+                    'WARNING': 0,
+                    'ERROR': 0
+                },
+                'category_counts': {},
+                'file_stats': {
+                    'total_files': 0,
+                    'files_scanned': 0,
+                    'files_with_findings': 0,
+                    'files_skipped': 0,
+                    'files_partial': 0,
+                    'files_error': 0,
+                    'completion_rate': 0
+                },
+                'memory_usage_mb': self.scan_stats['memory_usage_mb'],
+                'scan_stats': {
+                    'scan_duration': (
+                        datetime.now() - self.scan_stats['start_time']
+                    ).total_seconds() if self.scan_stats.get('start_time') else 0
+                }
+            },
+            'file_details': {
+                'scanned_files': [],
+                'skipped_files': [],
+                'partial_files': [],
+                'error_files': [],
+                'files_with_findings': []
+            },
+            'errors': [error] if error else []
+        }
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results with stats tracking"""
+   
         try:
             findings = results.get('results', [])
             paths = results.get('paths', {})
@@ -372,7 +413,6 @@ class SecurityScanner:
         except Exception as e:
             logger.error(f"Error in _process_scan_results: {str(e)}")
             return self._create_empty_result(error=str(e))
-
     async def scan_repository(self, repo_url: str, installation_token: str, user_id: str) -> Dict:
         
         try:
