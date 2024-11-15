@@ -118,8 +118,21 @@ def get_repo_results(owner, repo):
             'repository': repository,
             'timestamp': result.timestamp.isoformat(),
             'findings': findings,
-            'summary': result.results.get('summary', {}),
-            'metadata': result.results.get('metadata', {}),
+            'summary': {
+                'files': {
+                    'total': result.results.get('stats', {}).get('scan_stats', {}).get('total_files', 0),
+                    'scanned': result.results.get('stats', {}).get('scan_stats', {}).get('files_scanned', 0),
+                    'skipped': result.results.get('stats', {}).get('scan_stats', {}).get('files_skipped', 0),
+                    'partial': result.results.get('stats', {}).get('scan_stats', {}).get('files_partial', 0)
+                },
+                'severity_counts': result.results.get('stats', {}).get('severity_counts', {}),
+                'category_counts': result.results.get('stats', {}).get('category_counts', {}),
+                'total_findings': result.results.get('stats', {}).get('total_findings', 0)
+            },
+            'metadata': {
+                'scan_duration': result.results.get('stats', {}).get('scan_stats', {}).get('scan_duration', 0),
+                'memory_usage_mb': result.results.get('stats', {}).get('memory_usage_mb', 0)
+            },
             'pagination': {
                 'page': page,
                 'per_page': per_page,
