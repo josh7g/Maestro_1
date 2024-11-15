@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ScanConfig:
     """Configuration settings for security scanning"""
-    max_file_size_mb: int = 25
-    max_total_size_mb: int = 250
-    max_memory_mb: int = 450
+    max_file_size_mb: int = 50  #25
+    max_total_size_mb: int = 500 #250
+    max_memory_mb: int = 900 #450
     
     # Timeouts
     timeout_seconds: int = 300
