@@ -121,6 +121,27 @@ def get_repo_results(owner, repo):
     stored_summary = result.results.get('summary', {})
     findings = result.results.get('findings', [])
 
+    # Process each finding to add the file_name field
+    for finding in findings:
+        if 'file' in finding:
+            # Split the path and get everything after '/repo_YYYYMMDD_HHMMSS/'
+            full_path = finding['file']
+            path_parts = full_path.split('/')
+            
+            # Find the index of the part that starts with 'repo_'
+            repo_index = -1
+            for i, part in enumerate(path_parts):
+                if part.startswith('repo_'):
+                    repo_index = i
+                    break
+            
+            # If we found the repo_ part, take everything after it
+            if repo_index != -1 and repo_index + 1 < len(path_parts):
+                finding['file_name'] = '/'.join(path_parts[repo_index + 1:])
+            else:
+                # Fallback: just use the last part of the path
+                finding['file_name'] = path_parts[-1]
+
     # Apply filters
     if severity:
         findings = [f for f in findings if f.get('severity') == severity]
@@ -138,8 +159,8 @@ def get_repo_results(owner, repo):
             'timestamp': result.timestamp.isoformat(),
             'findings': paginated_findings,
             'summary': {
-                'total_findings': stored_summary.get('total_findings', 0),  # Will be 80
-                'files_scanned': stored_summary.get('files_scanned', 0),    # Will be 133
+                'total_findings': stored_summary.get('total_findings', 0),
+                'files_scanned': stored_summary.get('files_scanned', 0),
                 'severity_counts': stored_summary.get('severity_counts', {}),
                 'category_counts': stored_summary.get('category_counts', {})
             },
