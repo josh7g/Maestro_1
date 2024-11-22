@@ -111,7 +111,7 @@ async def _scan_chunk(self, files: List[str]) -> List[Dict]:
         cmd = [
             "semgrep",
             "scan",
-            "--config", "p/security-audit",
+            "--config", "auto",
             "--json",
             "--metrics=on",
             f"--max-memory={self.config.max_memory_mb}",
